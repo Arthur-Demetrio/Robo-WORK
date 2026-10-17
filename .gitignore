@@ -1,0 +1,26 @@
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE / sistema
+.vscode/
+.idea/
+.DS_Store
+*~
+
+# Arquivos locais e segredos
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs e arquivos temporários
+*.log
+*.tmp
