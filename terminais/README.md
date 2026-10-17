@@ -75,6 +75,19 @@ rviz2
 
 Arquivo: [06-rviz.sh](./06-rviz.sh)
 
+## Terminal 7 — Reset de odometria (sob demanda)
+
+**Use depois de iniciar a localização (Terminal 3).** Não é um processo contínuo: execute uma vez quando quiser zerar a referência de odometria na pose atual.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/robo_jazzy_ws/install/setup.bash
+export ROS_DOMAIN_ID=0
+ros2 service call /reset_odometry std_srvs/srv/Trigger "{}"
+```
+
+Script: [07-reset-odom.sh](./07-reset-odom.sh). Saída esperada inclui `success=True`, se o serviço estiver disponível e funcionar. Confira a pose com `ros2 topic echo /odom --once --field pose.pose.position`.
+
 ## Diagnóstico (terminal adicional)
 
 ```bash
