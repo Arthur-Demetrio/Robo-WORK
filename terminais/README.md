@@ -3,7 +3,7 @@
 Referência dos comandos utilizados no projeto (outubro/2026). **Não executados nem conferidos contra o notebook atual nesta publicação.** 
 
 ## Como usar
-Em cada terminal do Linux Mint, copie o bloco da etapa correspondente. Execute na ordem abaixo, conferindo se cada processo iniciou normalmente. **Não rode todos os comandos em um único terminal.** Se estiver apenas navegando pelo GitHub no computador pessoal, não execute esses comandos.
+Em cada terminal do Linux Mint, copie o bloco da etapa correspondente. Execute na ordem abaixo, conferindo se cada processo iniciou normalmente. **Não rode todos os comandos em um único terminal.** 
 
 Também é possível baixar esta pasta com o repositório e executar os arquivos `.sh` individualmente com `bash terminais/01-hardware.sh` etc., a partir da raiz do repositório. Os scripts não estão marcados como executáveis, por isso use `bash`.
 
