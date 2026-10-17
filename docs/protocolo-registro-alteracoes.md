@@ -30,3 +30,10 @@ Toda mudança proposta, executada ou testada deve gerar um registro claro e comp
 **Hipótese:** limite de giro insuficiente causa falha. **Mudança:** parâmetro X, de A para B. **Teste:** robô parado e percurso curto, com log do CM. **Resultado:** inconclusivo, bloqueio persistiu. **Decisão:** não marcar estável; manter registro e planejar medição do fluxo de comandos.
 
 Esse exemplo é ilustrativo, não relata um teste real.
+
+## Critério de relevância — documentação enxuta
+Registrar **somente** mudanças ou descobertas que ajudem a reproduzir, explicar, validar, diagnosticar ou recuperar o robô: código/firmware alterado, parâmetros com impacto real, resultado de teste significativo (inclusive falha útil), decisão técnica importante, configuração funcional e riscos novos.
+
+Não abrir documento, issue ou commit apenas para registrar comandos rotineiros, tentativas idênticas sem aprendizado, conversas exploratórias sem decisão, logs redundantes ou pequenas observações sem consequência. Consolidar várias tentativas relacionadas em **um registro sintético**, com links para evidências quando necessário.
+
+Alterações reais de código continuam sob controle de versão normalmente, mas a documentação narrativa deve ser proporcional à importância. Em caso de dúvida, priorizar um resumo curto no registro existente em vez de criar novos arquivos.
