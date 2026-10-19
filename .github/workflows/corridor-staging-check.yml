@@ -16,4 +16,4 @@ jobs:
       - name: Compile geometry and tests
         run: python -m compileall -q scripts/geometry_corridor_geometry.py scripts/geometry_corridor_staging.py scripts/geometry_collision_watch.py scripts/geometry_set_deadband.py tests/test_corridor_geometry.py
       - name: Test corridor geometry without ROS
-        run: python -m unittest discover -s tests -p 'test_corridor_geometry.py' -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
