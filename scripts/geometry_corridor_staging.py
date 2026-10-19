@@ -22,7 +22,7 @@ from tf2_ros import Buffer, TransformListener
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from lifecycle_msgs.srv import GetState
 
-from geometry_corridor_geometry import Grid, stage_for_path
+from geometry_corridor_geometry import Grid, stage_for_path, stage_from_map
 
 
 def yaw(q):
@@ -132,19 +132,30 @@ def main():
         final = stamped_pose(navigator, args.goal_x, args.goal_y,
                              math.radians(args.goal_yaw_deg))
         path = navigator.getPath(origin, final, use_start=True)
-        if path is None or len(path.poses) < 2:
-            raise RuntimeError("Planner nao devolveu caminho valido")
-
         g = Grid(
             m.info.width, m.info.height, m.info.resolution,
             m.info.origin.position.x, m.info.origin.position.y,
             yaw(m.info.origin.orientation), m.data
         )
-        pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
-        plan = stage_for_path(pts, g)
+        if path is not None and len(path.poses) >= 2:
+            pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+            try:
+                plan = stage_for_path(pts, g)
+                plan["detection_method"] = "global_path"
+            except ValueError as exc:
+                print("Caminho existe, mas staging nao identificado:", exc)
+                print("Tentando reconhecimento geometrico diretamente no mapa...")
+                plan = stage_from_map(
+                    start, (args.goal_x, args.goal_y), g)
+        else:
+            print("Planner nao achou caminho completo para o destino.")
+            print("Tentando identificar corredor e area de alinhamento no mapa...")
+            plan = stage_from_map(
+                start, (args.goal_x, args.goal_y), g)
         sx, sy, sa = plan["stage"]
         width = plan["estimated_width"]
         print("\n===== ALINHAMENTO ANTES DO CORREDOR =====")
+        print("Metodo:", plan.get("detection_method", "desconhecido"))
         print("Entrada estimada: (%.3f, %.3f)" % plan["entrance"])
         print("Largura entre paredes: %.2f m" % width)
         print("Eixo estimado: %.2f graus" % math.degrees(sa))
@@ -171,6 +182,11 @@ def main():
 
         print("\nATENCAO: esta opcao manda APENAS o Nav2 chegar ao ponto")
         print("de alinhamento, em area aberta. Nao atravessa o corredor.")
+        print("Confirmando com Nav2 um caminho para o ponto intermediario...")
+        stage_path = navigator.getPath(
+            origin, stamped_pose(navigator, sx, sy, sa), use_start=True)
+        if stage_path is None or len(stage_path.poses) < 2:
+            raise RuntimeError("Nav2 nao encontrou caminho ate ponto intermediario; nenhum movimento")
         print("Confirme no RViz que nao ha objetivo ativo, pessoas ou obstaculos.")
         if input("Digite ALINHAR para permitir a meta intermediaria: ").strip() != "ALINHAR":
             print("Cancelado pelo operador.")
