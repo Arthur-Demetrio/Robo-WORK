@@ -20,6 +20,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from tf2_ros import Buffer, TransformListener
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from lifecycle_msgs.srv import GetState
 
 from geometry_corridor_geometry import Grid, stage_for_path
 
@@ -51,14 +52,40 @@ def get_tf_pose(buffer):
             yaw(t.transform.rotation))
 
 
+def lifecycle_active(node, name):
+    client = node.create_client(GetState, "/" + name + "/get_state")
+    if not client.wait_for_service(timeout_sec=3.0):
+        raise RuntimeError(name + " lifecycle indisponivel")
+    future = client.call_async(GetState.Request())
+    rclpy.spin_until_future_complete(node, future, timeout_sec=3.0)
+    if not future.done() or future.result() is None:
+        raise RuntimeError(name + " nao respondeu ao estado")
+    if future.result().current_state.label != "active":
+        raise RuntimeError(name + " nao esta ATIVO")
+
+
+def run_goal(nav, pose, timeout):
+    nav.goToPose(pose)
+    deadline = time.monotonic() + timeout
+    while not nav.isTaskComplete():
+        if time.monotonic() > deadline:
+            nav.cancelTask()
+            raise RuntimeError("Timeout da meta: solicitada cancelacao")
+        time.sleep(0.1)
+    return nav.getResult() == TaskResult.SUCCEEDED
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--goal-x", type=float, required=True)
     parser.add_argument("--goal-y", type=float, required=True)
     parser.add_argument("--goal-yaw-deg", type=float, default=0.0)
     parser.add_argument("--execute-stage", action="store_true")
+    parser.add_argument("--continue-to-goal", action="store_true")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
+    if args.continue_to_goal and not args.execute_stage:
+        parser.error("--continue-to-goal exige --execute-stage")
 
     rclpy.init()
     navigator = BasicNavigator()
@@ -149,15 +176,11 @@ def main():
             print("Cancelado pelo operador.")
             return
 
-        navigator.goToPose(stamped_pose(navigator, sx, sy, sa))
-        deadline = time.monotonic() + args.timeout
-        while not navigator.isTaskComplete():
-            if time.monotonic() > deadline:
-                navigator.cancelTask()
-                raise RuntimeError("Timeout da navegacao intermediaria: cancelada")
-            time.sleep(0.1)
-
-        if navigator.getResult() != TaskResult.SUCCEEDED:
+        lifecycle_active(navigator, "collision_monitor")
+        lifecycle_active(navigator, "velocity_smoother")
+        lifecycle_active(navigator, "bt_navigator")
+        if not run_goal(navigator, stamped_pose(navigator, sx, sy, sa),
+                        args.timeout):
             raise RuntimeError("Nao chegou ao ponto de alinhamento: Nav2 falhou")
 
         rclpy.spin_once(navigator, timeout_sec=0.2)
@@ -169,8 +192,29 @@ def main():
         if heading_error > 5.0 or distance_error > 0.08:
             raise RuntimeError("Alinhamento ainda insuficiente; nao entrar no corredor")
         print("Alinhamento intermediario concluido.")
-        print("A travessia fica para uma meta supervisionada pelo RViz.")
+        stored = json.loads(filename.read_text())
+        stored["executed"] = True
+        stored["stage_completed"] = True
+        filename.write_text(json.dumps(stored, indent=2))
+        if args.continue_to_goal:
+            print("A proxima meta atravessa a passagem e deve ser supervisionada.")
+            if input("Digite ATRAVESSAR para enviar meta final: ").strip() != "ATRAVESSAR":
+                print("Travessia nao enviada.")
+                return
+            if not run_goal(navigator, final, args.timeout):
+                raise RuntimeError("Meta final falhou ou foi cancelada")
+            stored["through_completed"] = True
+            filename.write_text(json.dumps(stored, indent=2))
+            print("Meta final concluida.")
+        else:
+            print("A travessia fica para uma meta supervisionada pelo RViz.")
 
+    except KeyboardInterrupt:
+        print("Interrompido pelo operador; cancelando meta ativa.")
+        try:
+            navigator.cancelTask()
+        except Exception:
+            pass
     except Exception as ex:
         print("SEM PROGRESSAO AUTOMATICA:", ex)
         raise SystemExit(2)
