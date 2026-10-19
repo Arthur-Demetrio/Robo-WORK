@@ -157,12 +157,13 @@ def stage_for_path(points, grid, robot_width=0.63, spacing=0.05):
 
 
 def stage_from_map(start, goal, grid, robot_width=0.63):
-    """Fallback geometrico sem caminho global.
+    """Fallback quando planner aborta: detectar corredor conhecido no SLAM.
 
-    Procura secoes estreitas JA MAPEADAS perto da linha inicio-meta.
-    Confirma paredes dos dois lados por pelo menos 25 cm longitudinais;
-    procura disco livre ANTES da entrada e verifica ligacao mapeada ate
-    o inicio. Nao determina passagem completa nem substitui o Nav2.
+    Amostra secoes ao longo da linha inicial->destino e orientacoes
+    candidatas. Prefere o eixo com a MENOR largura entre paredes,
+    reduzindo risco de aceitar uma parede obliqua como eixo. Exige
+    trecho longitudinal de 45 cm e area aberta mapeada antes da entrada.
+    Nao executa motores; o Nav2 ainda precisa planejar ate a stage.
     """
     x0, y0 = start[:2]
     x1, y1 = goal[:2]
@@ -172,14 +173,8 @@ def stage_from_map(start, goal, grid, robot_width=0.63):
         raise ValueError("Meta muito proxima para inferir eixo do corredor")
     ux, uy = dx / dist, dy / dist
     base = math.atan2(uy, ux)
-    angles = [math.radians(a) for a in range(-35, 36, 5)]
-    width_min = robot_width + 0.06
-
-    def measure(x, y, tx, ty):
-        nx, ny = -ty, tx
-        left = clearance(grid, x, y, nx, ny, max_range=1.10)
-        right = clearance(grid, x, y, -nx, -ny, max_range=1.10)
-        return left, right
+    offsets = [math.radians(a) for a in range(-35, 36, 5)]
+    side_min = robot_width / 2 + 0.03
 
     for k in range(1, math.ceil(dist / 0.10) + 1):
         along = min(k * 0.10, dist - 0.05)
@@ -187,40 +182,54 @@ def stage_from_map(start, goal, grid, robot_width=0.63):
             continue
         px = x0 + ux * along
         py = y0 + uy * along
-        for theta in angles:
-            heading = base + theta
+        candidates = []
+
+        for offset in offsets:
+            heading = base + offset
             tx, ty = math.cos(heading), math.sin(heading)
+            nx, ny = -ty, tx
+            widths = []
             readings = []
-            for step in (0.0, 0.125, 0.25):
+            for step in (0.0, 0.15, 0.30, 0.45):
                 cx, cy = px + tx * step, py + ty * step
-                left, right = measure(cx, cy, tx, ty)
+                left = clearance(grid, cx, cy, nx, ny, max_range=1.10)
+                right = clearance(grid, cx, cy, -nx, -ny, max_range=1.10)
                 if left[0] != "obstacle" or right[0] != "obstacle":
                     break
                 width = left[1] + right[1]
                 if not (
                     0.72 <= width <= 1.05
-                    and min(left[1], right[1]) >= width_min / 2
+                    and min(left[1], right[1]) >= side_min
                 ):
                     break
-                readings.append((cx, cy, left[1], right[1], width))
-            if len(readings) != 3:
+                widths.append(width)
+                readings.append((left[1], right[1]))
+            if len(readings) != 4:
                 continue
+            mean_width = sum(widths) / len(widths)
+            variability = max(widths) - min(widths)
+            if variability > 0.12:
+                continue
+            # Eixo da passagem e perpendicular a secao de menor largura.
+            # Criterios de desempate: estabilidade e menor desvio do
+            # sentido de deslocamento aproximado.
+            score = (mean_width, variability, abs(offset))
+            candidates.append((score, heading, tx, ty, readings, mean_width))
 
-            # recentraliza entre as paredes (orientacao aproximada),
-            # sem exigir que a linha reta ao destino atraves o corredor.
-            _, _, dl, dr, width = readings[0]
-            shift = (dl - dr) / 2
-            center_x = px - ty * shift
-            center_y = py + tx * shift
+        for score, heading, tx, ty, readings, width in sorted(
+                candidates, key=lambda a: a[0]):
+            nx, ny = -ty, tx
+            left, right = readings[0]
+            shift = (left - right) / 2
             if abs(shift) > 0.10:
                 continue
+            center_x = px + nx * shift
+            center_y = py + ny * shift
             for backwards in (0.70, 0.80, 0.95, 1.10, 1.30, 1.55):
                 sx = center_x - tx * backwards
                 sy = center_y - ty * backwards
                 if not disc_is_mapped_free(grid, sx, sy, radius=0.53):
                     continue
-                # valida que a ligacao ate o staging nao atravessa
-                # obstaculos ou territorio desconhecido no mapa.
                 gap = math.hypot(sx - x0, sy - y0)
                 if gap > 0.01:
                     samples = max(2, math.ceil(gap / 0.10))
@@ -234,12 +243,12 @@ def stage_from_map(start, goal, grid, robot_width=0.63):
                     "stage": (sx, sy, heading),
                     "entrance": (center_x, center_y),
                     "corridor_heading": heading,
-                    "estimated_width": sum(r[4] for r in readings) / 3,
+                    "estimated_width": width,
                     "distance_stage_to_entrance": backwards,
                     "corridor_index": -1,
                     "detection_method": "map_first",
                 }
 
     raise ValueError(
-        "Mapa nao comprova passagem estreita e area de alinhamento "
-        "antes da entrada; movimente apenas apos ampliar mapeamento")
+        "Mapa nao comprova passagem estreita, eixo e area de "
+        "alinhamento antes da entrada; sem movimentacao")
