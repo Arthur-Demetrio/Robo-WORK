@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from geometry_corridor_geometry import Grid, stage_for_path, disc_is_mapped_free
+from geometry_corridor_geometry import Grid, stage_for_path, stage_from_map, disc_is_mapped_free
 
 
 def example(angle=0.0, walls=True):
@@ -57,6 +57,30 @@ class CorridorTests(unittest.TestCase):
         g.cells = [-1] * len(g.cells)
         with self.assertRaises(ValueError):
             stage_for_path(path, g)
+
+    def test_map_first_straight_when_global_path_unavailable(self):
+        g, _ = example(0.0)
+        result = stage_from_map((0, 0, 0), (3.3, 0), g)
+        self.assertEqual(result["detection_method"], "map_first")
+        self.assertLess(result["stage"][0], result["entrance"][0] - 0.65)
+        self.assertAlmostEqual(result["corridor_heading"], 0.0, delta=0.12)
+
+    def test_map_first_rotated(self):
+        theta = math.radians(32)
+        g, _ = example(theta)
+        result = stage_from_map((0, 0, 0), (3.3*math.cos(theta), 3.3*math.sin(theta)), g)
+        self.assertAlmostEqual(result["corridor_heading"], theta, delta=0.15)
+
+    def test_map_first_rejects_open_area(self):
+        g, _ = example(walls=False)
+        with self.assertRaises(ValueError):
+            stage_from_map((0, 0, 0), (3.3, 0), g)
+
+    def test_map_first_rejects_unknown_map(self):
+        g, _ = example()
+        g.cells = [-1] * len(g.cells)
+        with self.assertRaises(ValueError):
+            stage_from_map((0, 0, 0), (3.3, 0), g)
 
     def test_disc_conflict(self):
         g, path = example()
