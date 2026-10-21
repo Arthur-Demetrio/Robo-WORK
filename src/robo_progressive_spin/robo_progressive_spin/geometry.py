@@ -124,3 +124,130 @@ def choose_lateral_escape(left_distance, right_distance, half_width=0.315,
     amount, side, sign = max(candidates, key=lambda item:(item[0], item[2] < 0))
     return {"side": side, "distance": round(amount, 3),
             "signed_y": round(sign * amount, 3)}
+
+
+# ---------------------------------------------------------------------------
+# Folga continua durante o giro (correcao 2026-10-20).
+# As metricas antigas (arco limitado ao horizonte e folga em degraus de 1 cm
+# ate 4 cm) saturavam nos dois sentidos e o desempate caia sempre no sentido
+# pedido pela BT (+1). Esta metrica mede, sem teto baixo, a menor distancia
+# entre o contorno do robo e as celulas letais ao fim do micro-giro.
+# ---------------------------------------------------------------------------
+def obstacle_points(grid, pose, radius=1.0, threshold=100):
+    """Centros das celulas letais (>= threshold) ate `radius` do robo."""
+    info = grid.info
+    r = info.resolution
+    ox, oy = info.origin.position.x, info.origin.position.y
+    phi = yaw_of_quat(info.origin.orientation)
+    c, s = math.cos(phi), math.sin(phi)
+    cx, cy = grid_coords(grid, pose[0], pose[1])
+    k = int(math.ceil(radius / r))
+    points = []
+    for iy in range(max(0, cy - k), min(info.height, cy + k + 1)):
+        for ix in range(max(0, cx - k), min(info.width, cx + k + 1)):
+            if grid.data[iy * info.width + ix] >= threshold:
+                gx, gy = (ix + 0.5) * r, (iy + 0.5) * r
+                wx, wy = ox + c * gx - s * gy, oy + s * gx + c * gy
+                if math.hypot(wx - pose[0], wy - pose[1]) <= radius:
+                    points.append((wx, wy))
+    return points
+
+
+def _segment_distance(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    length2 = vx * vx + vy * vy
+    t = 0.0 if length2 <= 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / length2))
+    return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+
+def footprint_distance(points, pose, footprint, cap=0.30):
+    """Menor distancia entre os pontos e o contorno do footprint na pose (0 se dentro)."""
+    world = [to_world(x, y, pose) for x, y in footprint]
+    best = cap
+    for px, py in points:
+        if inside_polygon(px, py, world):
+            return 0.0
+        for i in range(len(world)):
+            ax, ay = world[i]
+            bx, by = world[(i + 1) % len(world)]
+            best = min(best, _segment_distance(px, py, ax, ay, bx, by))
+    return best
+
+
+def spin_options(grid, pose, footprint, amount, horizon, opening_distance):
+    """Evaluate both swept arcs, stopping each at the first unsafe pose.
+
+    Scores are geometric, independent of inflation costs. Unknown is blocked.
+    Returns only directions whose entire first micro-step is clear.
+    """
+    horizon = max(amount, min(horizon, 0.70))
+    points = obstacle_points(grid, pose)
+    options = []
+    for sign in (1, -1):
+        if not arc_clear(grid, pose, footprint, sign * amount):
+            continue
+        safe_angle = amount
+        best_opening = 0.0
+        first_opening = None
+        # Prefix testing: never score an opening beyond a blocked arc.
+        n = max(1, math.ceil(horizon / 0.02))
+        for i in range(1, n + 1):
+            angle = horizon * i / n
+            trial = (pose[0], pose[1], pose[2] + sign * angle)
+            if not footprint_clear(grid, trial, footprint):
+                break
+            safe_angle = max(safe_angle, angle)
+            if i == n or i % 3 == 0:
+                for distance in sorted(set((0.08, 0.14, opening_distance))):
+                    if distance > opening_distance:
+                        continue
+                    if not movement_clear(grid, trial, footprint, distance, 0):
+                        break
+                    best_opening = max(best_opening, distance)
+                    if distance >= opening_distance and first_opening is None:
+                        first_opening = angle
+        # Extra clearance of the *whole immediate arc*, not just its endpoint.
+        clearance = 0.0
+        for pad in (0.01, 0.02, 0.03, 0.04):
+            expanded = [(x + math.copysign(pad, x),
+                         y + math.copysign(pad, y)) for x, y in footprint]
+            if not arc_clear(grid, pose, expanded, sign * amount):
+                break
+            clearance = pad
+        # Folga continua ao fim do micro-giro e de dois micro-giros (se livres).
+        swept = footprint_distance(points, (pose[0], pose[1], pose[2] + sign * amount), footprint)
+        second = min(2 * amount, safe_angle)
+        if second > amount + 1e-6:
+            swept = min(swept, footprint_distance(
+                points, (pose[0], pose[1], pose[2] + sign * second), footprint))
+        options.append(dict(sign=sign, safe_angle=safe_angle,
+                            opening=best_opening, clearance=clearance,
+                            swept=swept, first_opening=first_opening))
+    return options
+
+
+def select_spin(options, previous=0, preferred=1):
+    """Keep the chosen direction within one action; never undo a micro-step.
+
+    If it becomes blocked, abort and return control to the BT for repositioning.
+    Initial ranking (2026-10-20): when either side gets closer than 8 cm, the
+    side that keeps the footprint farther from lethal cells wins; otherwise
+    reachable exit, continuous swept clearance, reachable angle, forward
+    opening, then requested direction only for a geometric tie.
+    """
+    if previous:
+        return next((o for o in options if o['sign'] == previous), None)
+    if not options:
+        return None
+    tight = 0.08  # abaixo de 8 cm de folga, seguranca decide antes da abertura
+    return max(options, key=lambda o: (
+        # 1) em espaco apertado: o sentido que mantem o contorno mais longe
+        int(round(min(o.get('swept', 0.0), tight) / 0.005)),
+        o['first_opening'] is not None,
+        # 2) folga continua em degraus de 5 mm (antes: degraus de 1 cm ate 4 cm)
+        int(round(o.get('swept', 0.0) / 0.005)),
+        round(o['clearance'], 3),
+        round(o['safe_angle'], 3),
+        round(o['opening'], 3),
+        -(o['first_opening'] if o['first_opening'] is not None else 10),
+        o['sign'] == preferred))

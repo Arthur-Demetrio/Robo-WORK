@@ -17,6 +17,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import TwistStamped
+from nav_msgs.msg import Odometry  # ESCAPE_ODOM_PATCH
 from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import DriveOnHeading
 
@@ -61,6 +62,11 @@ class MecanumEscapeNode(Node):
 
         self.last_final_cmd_y = 0.0
 
+        # ESCAPE_ODOM_PATCH: distância medida pela odometria (já escalada por
+        # linear_scale_y), e não pela integral do comando, que subestimava o
+        # deslocamento real em ~3x (6 cm pedidos -> ~20 cm reais).
+        self.latest_odom = None
+
         self.callback_group = ReentrantCallbackGroup()
 
         # ----------------------------------------------------
@@ -78,6 +84,14 @@ class MecanumEscapeNode(Node):
         # Saída REAL depois do Collision Monitor.
         # Usamos isso para saber se a lateral realmente
         # está sendo liberada.
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/odom',
+            self.odom_callback,
+            20,
+            callback_group=self.callback_group,
+        )
+
         self.final_cmd_sub = self.create_subscription(
             TwistStamped,
             '/cmd_vel',
@@ -123,6 +137,14 @@ class MecanumEscapeNode(Node):
         with self.lock:
             self.latest_scan = msg
             self.latest_scan_receive_time = time.monotonic()
+
+    def odom_callback(self, msg):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        with self.lock:
+            self.latest_odom = (msg.pose.pose.position.x,
+                                msg.pose.pose.position.y, yaw)
 
     def final_cmd_callback(self, msg):
         with self.lock:
@@ -394,6 +416,18 @@ class MecanumEscapeNode(Node):
         feedback = DriveOnHeading.Feedback()
 
         traveled = 0.0
+        with self.lock:
+            start_odom = self.latest_odom
+        if start_odom is None:
+            self.stop()
+            result.total_elapsed_time = Duration(
+                seconds=time.monotonic() - start_time
+            ).to_msg()
+            result.error_code = 1
+            result.error_msg = 'Odometria indisponivel'
+            self.get_logger().error('Escape cancelado: sem /odom.')
+            goal_handle.abort()
+            return result
         previous_time = time.monotonic()
         last_progress_time = previous_time
 
@@ -444,6 +478,7 @@ class MecanumEscapeNode(Node):
                 )
 
                 final_y = self.last_final_cmd_y
+                odom_now = self.latest_odom
 
             if current_scan_age > self.scan_timeout:
 
@@ -471,12 +506,18 @@ class MecanumEscapeNode(Node):
             dt = now - previous_time
             previous_time = now
 
-            # Integra SOMENTE o comando que realmente passou
-            # pelo Collision Monitor.
-            useful_final_y = final_y * direction
+            # Deslocamento lateral pela odometria, no referencial do
+            # robô no início do escape. A odometria integra o /cmd_vel
+            # final (depois do Collision Monitor), então bloqueios não
+            # contam como avanço.
+            _ = dt, final_y
+            dx = odom_now[0] - start_odom[0]
+            dy = odom_now[1] - start_odom[1]
+            th = start_odom[2]
+            lateral = (-dx * math.sin(th) + dy * math.cos(th)) * direction
 
-            if useful_final_y > 0.005:
-                traveled += useful_final_y * dt
+            if lateral > traveled + 0.002:
+                traveled = lateral
                 last_progress_time = now
 
             # Se o Collision Monitor estiver bloqueando,

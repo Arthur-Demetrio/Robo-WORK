@@ -20,7 +20,7 @@ from action_msgs.msg import GoalStatus
 from tf2_ros import Buffer, TransformListener
 
 from .geometry import (arc_clear, footprint_clear, movement_clear,
-                       yaw_of_quat)
+                       yaw_of_quat, spin_options, select_spin)
 
 
 class ProgressiveSpin(Node):
@@ -32,6 +32,7 @@ class ProgressiveSpin(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('max_angle', 0.70)
         self.declare_parameter('step_angle', 0.12)
+        self.declare_parameter('lookahead_angle', 0.36)
         self.declare_parameter('opening_distance', 0.20)
         self.declare_parameter('min_success_angle', 0.10)
         self.declare_parameter('map_timeout', 2.5)
@@ -239,22 +240,38 @@ class ProgressiveSpin(Node):
                                         'abertura frontal verificada após %.1f graus; BT pode replanejar' %
                                         math.degrees(total_turn))
                 amount = min(step, max_angle - total_turn)
-                options = []
-                for sign in (1, -1):
-                    if arc_clear(grid, pose, footprint, sign * amount):
-                        cx, cy, ct = pose
-                        trial_pose = (cx, cy, ct + sign * amount)
-                        # Prefer directions that make a forward motion feasible.
-                        # Tie: stick with the previous direction to avoid oscillation.
-                        lookahead = sum(movement_clear(grid, trial_pose, footprint, d, 0)
-                                        for d in (0.08, 0.14, self.p('opening_distance')))
-                        options.append((lookahead + (0.25 if sign == direction else 0), sign))
-                if not options:
+                options = spin_options(
+                    grid, pose, footprint, amount,
+                    min(self.p('lookahead_angle'), max_angle - total_turn),
+                    self.p('opening_distance'))
+                for candidate in options:
+                    self.get_logger().info(
+                        'spin avaliacao: sentido=%+d arco_livre=%.1f graus '
+                        'folga_extra=%.2f m abertura=%.2f m folga_giro=%.3f m' % (
+                            candidate['sign'], math.degrees(candidate['safe_angle']),
+                            candidate['clearance'], candidate['opening'],
+                            candidate.get('swept', -1.0)))
+                chosen = select_spin(options, direction, 1 if g.target_yaw > 0 else -1)
+                if chosen is None:
                     return self._finish(handle, 'fail', Spin.Result.COLLISION_AHEAD,
-                                        'nenhum micro-giro seguro no costmap; usar escape lateral/ré')
-                _, direction = max(options, key=lambda t: (t[0], t[1]))
+                                        'sentido bloqueado; sem inverter giro; BT deve reposicionar')
+                direction = chosen['sign']
+                # Planning can be expensive: use fresh geometry before moving.
+                fresh = self.get_map()
+                if fresh is None:
+                    return self._finish(handle, 'fail', Spin.Result.COLLISION_AHEAD,
+                                        'costmap expirou durante avaliacao')
+                pose = self.pose_in_grid(fresh)
+                if not arc_clear(fresh, pose, footprint, direction * amount):
+                    return self._finish(handle, 'fail', Spin.Result.COLLISION_AHEAD,
+                                        'micro-giro deixou de estar livre')
+                if handle.is_cancel_requested:
+                    return self._finish(handle, 'cancel', Spin.Result.NONE, 'cancelado')
+                if time.monotonic() >= deadline - 0.25:
+                    return self._finish(handle, 'fail', Spin.Result.TIMEOUT,
+                                        'tempo esgotado na avaliacao geometrica')
                 remaining = deadline - time.monotonic()
-                allowed = min(self.p('step_timeout'), max(1.0, remaining - 0.25))
+                allowed = min(self.p('step_timeout'), remaining - 0.25)
                 self.get_logger().info('micro-giro %+.1f graus (acumulado %.1f / max %.1f)' %
                                        (math.degrees(direction * amount), math.degrees(total_turn),
                                         math.degrees(max_angle)))
