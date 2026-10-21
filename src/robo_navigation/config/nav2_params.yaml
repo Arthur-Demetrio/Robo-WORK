@@ -14,10 +14,9 @@ controller_server:
     controller_plugins:
     - FollowPath
     progress_checker:
-      plugin: nav2_controller::PoseProgressChecker
-      required_movement_radius: 0.04
-      required_movement_angle: 0.08
-      movement_time_allowance: 7.0
+      plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.05
+      movement_time_allowance: 12.0
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       stateful: true
@@ -26,14 +25,14 @@ controller_server:
     FollowPath:
       plugin: dwb_core::DWBLocalPlanner
       debug_trajectory_details: true
-      min_vel_x: 0.0
-      max_vel_x: 0.05
-      min_vel_y: -0.035
-      max_vel_y: 0.035
-      max_vel_theta: 0.08
-      min_speed_xy: 0.0
-      max_speed_xy: 0.05
-      min_speed_theta: 0.0
+      min_vel_x: -0.08
+      max_vel_x: 0.08
+      min_vel_y: -0.08
+      max_vel_y: 0.08
+      max_vel_theta: 0.14
+      min_speed_xy: 0.01
+      max_speed_xy: 0.08
+      min_speed_theta: 0.02
       acc_lim_x: 0.2
       acc_lim_y: 0.2
       acc_lim_theta: 0.2
@@ -43,7 +42,7 @@ controller_server:
       vx_samples: 7
       vy_samples: 7
       vtheta_samples: 7
-      sim_time: 1.5
+      sim_time: 0.8
       linear_granularity: 0.025
       angular_granularity: 0.025
       transform_tolerance: 0.3
@@ -59,6 +58,9 @@ controller_server:
       - PathAlign
       - PathDist
       - GoalDist
+      - "Twirling"
+      Twirling.class: "dwb_critics::TwirlingCritic"
+      Twirling.scale: 5.0
       ObstacleFootprint.scale: 0.1
       PathAlign.scale: 24.0
       PathAlign.forward_point_distance: 0.1
@@ -200,7 +202,6 @@ behavior_server:
     enable_stamped_cmd_vel: true
 bt_navigator:
   ros__parameters:
-    default_nav_to_pose_bt_xml: "/home/marcos/robo_jazzy_ws/src/robo_navigation/behavior_trees/navigate_to_pose_corridor.xml"
     use_sim_time: false
     global_frame: map
     robot_base_frame: base_link
@@ -233,13 +234,13 @@ velocity_smoother:
     scale_velocities: true
     feedback: OPEN_LOOP
     max_velocity:
-    - 0.05
-    - 0.035
     - 0.08
+    - 0.08
+    - 0.14
     min_velocity:
-    - -0.05
-    - -0.035
     - -0.08
+    - -0.08
+    - -0.14
     max_accel:
     - 0.2
     - 0.2
@@ -287,14 +288,12 @@ collision_monitor:
       - left
       - backward
       - right
-      - rotation_positive
-      - rotation_negative
       - stopped
 
       # Movimento predominantemente para frente:
       # -45 graus ate +45 graus.
       forward:
-        points: "[[0.425, 0.345], [0.425, -0.345], [-0.050, -0.345], [-0.050, 0.345]]"
+        points: "[[0.425, 0.325], [0.425, -0.325], [-0.050, -0.325], [-0.050, 0.325]]"
         linear_min: 0.005
         linear_max: 0.20
         direction_start_angle: -0.785
@@ -316,7 +315,7 @@ collision_monitor:
       # Movimento predominantemente de re:
       # +135 graus passando por pi ate -135 graus.
       backward:
-        points: "[[0.050, 0.345], [0.050, -0.345], [-0.265, -0.345], [-0.265, 0.345]]"
+        points: "[[0.050, 0.325], [0.050, -0.325], [-0.265, -0.325], [-0.265, 0.325]]"
         linear_min: 0.005
         linear_max: 0.20
         direction_start_angle: 2.356
@@ -335,29 +334,10 @@ collision_monitor:
         theta_min: -0.20
         theta_max: 0.20
 
-      # Rotacao pura: protecao do circulo varrido.
-      rotation_positive:
-        points: "[[0.562, 0.0], [0.487, 0.281], [0.281, 0.487], [0.0, 0.562], [-0.281, 0.487], [-0.487, 0.281], [-0.562, 0.0], [-0.487, -0.281], [-0.281, -0.487], [-0.0, -0.562], [0.281, -0.487], [0.487, -0.281]]"
-        linear_min: 0.0
-        linear_max: 0.005
-        direction_start_angle: -3.1415
-        direction_end_angle: 3.1415
-        theta_min: 0.001
-        theta_max: 0.20
-
-      rotation_negative:
-        points: "[[0.562, 0.0], [0.487, 0.281], [0.281, 0.487], [0.0, 0.562], [-0.281, 0.487], [-0.487, 0.281], [-0.562, 0.0], [-0.487, -0.281], [-0.281, -0.487], [-0.0, -0.562], [0.281, -0.487], [0.487, -0.281]]"
-        linear_min: 0.0
-        linear_max: 0.005
-        direction_start_angle: -3.1415
-        direction_end_angle: 3.1415
-        theta_min: -0.20
-        theta_max: -0.001
-
       # Fallback para robo parado ou rotacao praticamente pura.
       # Aproxima o circulo varrido pelos cantos do footprint.
       stopped:
-        points: '[[0.405, 0.350], [0.405, -0.350], [-0.245, -0.350], [-0.245, 0.350]]'
+        points: "[[0.405, 0.355], [0.405, -0.355], [-0.245, -0.355], [-0.245, 0.355]]"
         linear_min: 0.0
         linear_max: 0.005
         direction_start_angle: -3.1415
