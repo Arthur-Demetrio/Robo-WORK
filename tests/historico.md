@@ -11,6 +11,14 @@
 | 13–14/10 | Recuperação em quinas | Relatados 6 goals concluídos, 2 escapes laterais, 47 'No valid trajectories', 18 'Failed to make progress' e 103 STOP do Collision Monitor | Resultados relatados, não reproduzidos |
 | 13–14/10 | Spin progressivo | Comando angular registrado; em testes o robô não girou, com bloqueio VelocityPolygonStop | Falha em investigação |
 | 15–16/10 | Bancada e exploração | Discussão de estratégia sem mapa prévio e identificação de bancada por múltiplas observações | Planejamento, **não teste físico validado** |
+| 21/10 | Travessia LiDAR com alinhador v3.4 | Ida: 3 medições e alinhamento ~5 s; volta: 1 medição e alinhamento ~1 s; ambas as travessias ~7 s; sem bloqueios observados | Melhor resultado relatado até a data; conferir bags para validação |
+
+## Referência do teste de travessia de 21/10/2026
+
+- Código: commit [`5576380`](https://github.com/OttavioSilva/Robo-WORK/commit/5576380), integrado pelo [PR #7](https://github.com/OttavioSilva/Robo-WORK/pull/7).
+- Arquivos alterados: alinhador v3.4, parâmetros Nav2/Collision Monitor, árvore de comportamento, geometria e log do smart_spin, medição de escape por `/odom`.
+- Medições e tempos informados pelo responsável pelo teste; bags e logs não foram reanalisados neste registro.
+- Próxima validação: repetir ida e volta de diferentes posições e orientações e verificar consistência do alinhamento, folgas e bloqueios.
 
 ## Interpretação
 Os números acima foram relatados em sessões passadas e não representam comparativo controlado. Conferir período amostral, parâmetros e condições físicas antes de traçar indicadores. Evitar extrapolar sucesso de um cenário para competição.
