@@ -12,6 +12,7 @@
 | 13–14/10 | Spin progressivo | Comando angular registrado; em testes o robô não girou, com bloqueio VelocityPolygonStop | Falha em investigação |
 | 15–16/10 | Bancada e exploração | Discussão de estratégia sem mapa prévio e identificação de bancada por múltiplas observações | Planejamento, **não teste físico validado** |
 | 21/10 | Travessia LiDAR com alinhador v3.4 | Ida: 3 medições e alinhamento ~5 s; volta: 1 medição e alinhamento ~1 s; ambas as travessias ~7 s; sem bloqueios observados | Melhor resultado relatado até a data; conferir bags para validação |
+| 22/10 | Identificação de bancadas e encosto em WS_1 | Testes de candidatos via `service_areas`; `encostar2` (alinhador v3.6): navegação 16,9 s, encosto 18,0 s com 8 medições, folga LiDAR 6 cm para alvo de 8 cm, erro lateral recalculado ~9,5 cm e travessia 8,8 s | Evolução funcional com imprecisões; correções de validação solicitadas, não consideradas testadas |
 
 ## Referência do teste de travessia de 21/10/2026
 
@@ -19,6 +20,24 @@
 - Arquivos alterados: alinhador v3.4, parâmetros Nav2/Collision Monitor, árvore de comportamento, geometria e log do smart_spin, medição de escape por `/odom`.
 - Medições e tempos informados pelo responsável pelo teste; bags e logs não foram reanalisados neste registro.
 - Próxima validação: repetir ida e volta de diferentes posições e orientações e verificar consistência do alinhamento, folgas e bloqueios.
+
+## Desenvolvimento e testes de 22/10/2026
+
+**Identificação e representação das áreas de serviço**
+
+- O nó `service_areas` foi executado, publicando `/service_areas/marcadores` para visualização no RViz. Em uma inspeção, a mensagem continha apenas `Marker.DELETEALL`, sem candidatos publicados naquele instante.
+- Houve falsos positivos em corredores/parede. Em identificações manuais, C6 correspondia à mesa e C7 ao corredor; em outra rodada automática, C3 era a mesa e C1/C4/C5 eram corredores. Esses identificadores são locais às rodadas, não IDs permanentes.
+- Foi experimentado um filtro de continuidade de pelo menos 1 m para reduzir falsos positivos; após o ajuste, o corredor deixou de aparecer naquela observação.
+- A área de trabalho recebeu o nome **WS_1**. O alinhador era acionado por `/ir_para_area` e usava o arquivo `~/mapas/service_areas.yaml`.
+
+**Encosto e travessia**
+
+- No bag identificado como `encostar2`, relatado para o **alinhador v3.6**: navegação de **16,9 s**, encosto de **18,0 s com 8 medições** e travessia de **8,8 s**.
+- A folga LiDAR medida foi **6,0 cm**, diante de uma meta de **8 cm**; o erro lateral recalculado foi de cerca de **9,5 cm**. Portanto, não classificar o encosto como precisão satisfatória apenas porque o movimento prosseguiu.
+- Foram solicitadas correções para **parar quando a face da bancada não for encontrada**, **exigir centro válido** e **validar distância, ângulo e centro antes de declarar sucesso**. O escopo foi o **encosto da bancada**, não o centralizador de corredor/travessia nem o detector `service_areas.py`.
+- Houve evolução do script do alinhador durante o dia; versões e resultados não devem ser confundidos. **Não há neste registro comprovação de que as correções finais tenham sido testadas fisicamente**.
+
+**Limites deste registro:** observações e métricas provenientes dos relatos e registros da sessão; sem reprocessamento independente dos bags. O código de 22/10 não foi incluído nesta atualização documental e precisa ser comparado com os arquivos locais antes de substituir a versão publicada no GitHub.
 
 ## Interpretação
 Os números acima foram relatados em sessões passadas e não representam comparativo controlado. Conferir período amostral, parâmetros e condições físicas antes de traçar indicadores. Evitar extrapolar sucesso de um cenário para competição.
