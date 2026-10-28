@@ -39,6 +39,18 @@
 
 **Limites deste registro:** observações e métricas provenientes dos relatos e registros da sessão; sem reprocessamento independente dos bags. O código de 22/10 não foi incluído nesta atualização documental e precisa ser comparado com os arquivos locais antes de substituir a versão publicada no GitHub.
 
+## Registros de 26 a 28/10/2026 — pacote recebido
+
+As observações abaixo foram extraídas dos relatórios `RESULTADOS_26-10.md`, `RESULTADOS_27-10.md` e `RESULTADOS_28-10.md` do ZIP `robo_2026-10-28.zip`. Os logs e bags não foram reprocessados aqui; ver [resumo da atualização](../docs/atualizacao-2026-10-28.md).
+
+| Data | Teste e desenvolvimento | Resultado e ressalva |
+|---|---|---|
+| 26/10 | Executor BTT1 com tarefas simuladas; ajustes Nav2/recuperação | 11/11 etapas e 4m25s da tarefa, mas travamento posterior ao tentar FINISH |
+| 27/10 | `filtro_corpo_scan.py`, tópico `/scan_nav` e missão WS_1–WS_2–WS_1 | Replay mostrou eliminação do STOP falso nos scans gravados; missão concluída em ~2m50s, com falha no FINISH |
+| 28/10 | Curvas 4–6, alinhador v3.14–v3.16, avaliação de deriva e patch DWB | Saídas laterais de curva5 concluídas; v3.16 obteve 112/120 em simulação de deriva e 19/36 no teste do nó em curva; patch `dwb_sem_lateral` piorou e foi desfeito |
+
+O ZIP descreve a **v3.16 como candidata para prova, não como versão estável**. Os códigos do ZIP precisam ser importados e revisados nesta branch para manter o Git correspondente ao relatório.
+
 ## Interpretação
 Os números acima foram relatados em sessões passadas e não representam comparativo controlado. Conferir período amostral, parâmetros e condições físicas antes de traçar indicadores. Evitar extrapolar sucesso de um cenário para competição.
 
