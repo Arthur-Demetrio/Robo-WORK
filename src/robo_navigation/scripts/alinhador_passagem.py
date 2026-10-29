@@ -1,5 +1,40 @@
 #!/usr/bin/env python3
-"""Alinhador de passagens estreitas para o Nav2 (v3.4: travessia guiada pelo LiDAR).
+"""Alinhador de passagens estreitas para o Nav2 (v3.16: travessia pelo LiDAR + ir ate Service Area/START/FINISH, encostar e publicar o resultado).
+
+v3.16 (teste curva5 28/10): (1) o caminho que corta o canto de um L na diagonal virava uma
+passagem so, com eixo de -147 graus, e o preparo ia para 1 m fora, na area aberta: agora o
+trecho estreito termina onde o caminho vira mais de 45 graus. (2) Na saida lateral, a quina
+do cruzamento vista de lado (3 pontos) contava como parede de tras e o centro brigava com a
+medida pela parede da frente (10 s de vai e vem): o centro pelas folgas so vale com parede
+de verdade dos dois lados; a parada de seguranca usa o ponto mais perto (quina inclusive).
+
+v3.15 (teste curva4 28/10): saida lateral centrada pela folga real do para-choque e da
+traseira (sem supor a largura do corredor), parada de seguranca a 3 cm que vale sempre
+(na volta o robo deslizou com a traseira a 0-1 cm da parede porque as correcoes tinham
+acabado), contador de correcoes zera a cada 6 cm de progresso (na ida abortou a 17 cm do
+fim, centrado) e, sem correcoes, segue deslizando se as folgas estiverem boas.
+
+v3.14 (teste curva3 12:06): saida lateral sem vai-e-vem (pulsos com 0,2 m/s reais, tolerancia
+de 4-6 cm porque as paredes reais nao sao retas), medida so com a parede ao lado do corpo e,
+nos ultimos 0,5 m, so termina de sair (perto da saida a medida pegava outras paredes).
+
+v3.13 (teste curva2): saida lateral com ajuste para frente/tras em pulsos curtos medidos pelo
+LiDAR (o robo anda ~0,1 m/s com qualquer comando), parede de tras so perto de onde deve estar,
+afasta da parede antes de girar, e pose de preparo procurada mais longe/sem margem (na volta
+o mapa nao achou preparo e o Nav2 tentou fazer a curva sozinho).
+
+v3.12: no cruzamento com curva o robo para pelo LiDAR (parede a frente ou do lado de la do
+corredor novo), e nao pelo mapa: no teste curva1 o mapa errou ~15 cm no eixo do corredor e o
+robo encostou na parede da frente.
+
+v3.11: cruzamentos de corredores. Reto (+ ou T atravessado): uma travessia so, do comeco
+do primeiro corredor ao fim do ultimo. Com curva (L, T ou +): o robo entra de frente, para
+no cruzamento com o corpo centrado no corredor novo e sai DE LADO (mecanum), sem girar,
+guiado pela parede da frente (e de tras, se o LiDAR ver).
+
+v3.10: em pontos sem mesa (START/FINISH) o angulo final nao importa: o goal vai com o
+angulo de quem chega pelo caminho e o alinhador aceita a chegada quando o robo fica
+1,5 s a menos de 10 cm do ponto (cancela o Nav2 em vez de esperar o giro final).
 
 Recebe um goal (topico /goal_pose_alinhado, ferramenta "2D Goal Pose" do RViz
 com o topico trocado), pede um caminho ao planner, procura no mapa trechos
@@ -18,6 +53,7 @@ Uso:
     python3 alinhador_passagem.py --ros-args -p modo_travessia:=nav2   (comportamento v2)
 """
 import math
+import os
 import threading
 import time
 
@@ -119,19 +155,31 @@ def _comprimento(pontos, i0, i1):
                for k in range(i0, i1))
 
 
-def achar_passagens(pontos, larg, largura_estreita, comprimento_min=0.15, buraco_max=2):
-    """Trechos contiguos onde as duas paredes existem e a soma < largura_estreita."""
+def achar_passagens(pontos, larg, largura_estreita, comprimento_min=0.15, buraco_max=2,
+                    giro_max=math.radians(45)):
+    """Trechos contiguos onde as duas paredes existem e a soma < largura_estreita.
+
+    v3.15: o trecho termina onde o caminho vira mais de giro_max em relacao ao comeco dele
+    (canto de um L cortado na diagonal: no curva5 os dois bracos viraram uma passagem so,
+    com eixo de -147 graus, e o preparo foi parar 1 m fora, na area aberta).
+    """
     estreito = [de is not None and dd is not None and de + dd < largura_estreita
                 for de, dd, _ in larg]
+    cos_max = math.cos(giro_max)
     trechos = []
     i, n = 0, len(pontos)
     while i < n:
         if not estreito[i]:
             i += 1
             continue
+        t0 = larg[i][2]
         j, ultimo, buraco = i, i, 0
         while j + 1 < n:
             j += 1
+            tj = larg[j][2]
+            if tj[0] * t0[0] + tj[1] * t0[1] < cos_max:
+                j -= 1
+                break
             if estreito[j]:
                 ultimo, buraco = j, 0
             else:
@@ -183,6 +231,31 @@ def geometria_passagem(pontos, larg, i0, i1):
                 eixo=(ax, ay), largura=larguras[len(larguras) // 2])
 
 
+def yaw_chegada(caminho, goal_xy, robo=None, recuo=0.30):
+    """v3.10: angulo de quem chega ao goal pelo caminho (direcao do ultimo trecho de ~recuo m).
+
+    Sem caminho usa a direcao robo->goal; com o robo ja em cima do ponto (< 15 cm) devolve o
+    angulo atual dele (nenhum giro). robo = (x, y, yaw) ou None. Devolve None se nao der.
+    """
+    gx, gy = goal_xy
+    if caminho and len(caminho) >= 2:
+        acum = 0.0
+        ant = (gx, gy)
+        for px, py in reversed(caminho[:-1]):
+            acum += math.hypot(px - ant[0], py - ant[1])
+            ant = (px, py)
+            if acum >= recuo:
+                break
+        if math.hypot(gx - ant[0], gy - ant[1]) >= 0.05:
+            return math.atan2(gy - ant[1], gx - ant[0])
+    if robo is not None:
+        d = math.hypot(gx - robo[0], gy - robo[1])
+        if d < 0.15:
+            return robo[2]
+        return math.atan2(gy - robo[1], gx - robo[0])
+    return None
+
+
 def pose_livre(mapa, x, y, yaw, footprint=FOOTPRINT, margem=0.03):
     """Contorno (com margem) e seu interior sem celulas ocupadas."""
     c, s = math.cos(yaw), math.sin(yaw)
@@ -202,6 +275,47 @@ def pose_livre(mapa, x, y, yaw, footprint=FOOTPRINT, margem=0.03):
     return True
 
 
+def analisar_juncao(pontos, larg, trechos, k, gA, gap_max=1.30):
+    """v3.11: o que vem depois da passagem trechos[k] (geometria gA)?
+
+    - None: nada perto (ou um angulo que nao sei tratar);
+    - dict(tipo='reto', ...): outra passagem na mesma linha logo depois (cruzamento em + ou
+      T atravessado reto): a travessia continua ate a saida dela;
+    - dict(tipo='curva', ...): passagem perpendicular logo depois (L, T ou +, virando): o robo
+      para no cruzamento com o corpo centrado no corredor novo e sai DE LADO, sem girar.
+    """
+    if k + 1 >= len(trechos):
+        return None
+    i0b, i1b = trechos[k + 1]
+    if _comprimento(pontos, trechos[k][1], i0b) > gap_max:
+        return None
+    gB = geometria_passagem(pontos, larg, i0b, i1b)
+    ax, ay = gA['eixo']
+    bx, by = gB['eixo']
+    dot = ax * bx + ay * by
+    cruz = ax * by - ay * bx
+    if dot > math.cos(math.radians(20)):
+        # mesma linha? (eixo de B nao pode estar deslocado do de A)
+        ex, ey = gB['entrada'][0] - gA['saida'][0], gB['entrada'][1] - gA['saida'][1]
+        if abs(ex * -ay + ey * ax) > 0.12:
+            return None
+        return dict(tipo='reto', saida=gB['saida'], largura=min(gA['largura'], gB['largura']),
+                    entrada_b=gB['entrada'], indices_b=(i0b, i1b))
+    if abs(dot) < math.cos(math.radians(60)):
+        # ponto de encontro dos eixos: A0 + t*a = B0 + u*b
+        a0x, a0y = gA['saida']
+        b0x, b0y = gB['entrada']
+        den = ax * by - ay * bx
+        t = ((b0x - a0x) * by - (b0y - a0y) * bx) / den
+        jx, jy = a0x + t * ax, a0y + t * ay
+        if not (-0.40 <= t <= gap_max):
+            return None
+        return dict(tipo='curva', juncao=(jx, jy), eixo_b=(bx, by), lado=1.0 if cruz > 0 else -1.0,
+                    entrada_b=gB['entrada'], saida_b=gB['saida'], largura_b=gB['largura'],
+                    indices_b=(i0b, i1b))
+    return None
+
+
 def planejar_etapas(mapa, pontos, goal_xy, largura_estreita=0.90, distancia_preparo=0.60,
                     distancia_saida=0.45, ignorar_inicio=0.30, ja_tratadas=()):
     """Primeira passagem estreita a frente: devolve (etapas, info) ou ([], motivo).
@@ -211,21 +325,36 @@ def planejar_etapas(mapa, pontos, goal_xy, largura_estreita=0.90, distancia_prep
     if len(pontos) < 5:
         return [], 'caminho curto demais'
     larg = larguras_no_caminho(mapa, pontos)
-    for i0, i1 in achar_passagens(pontos, larg, largura_estreita):
+    trechos = achar_passagens(pontos, larg, largura_estreita)
+    for k, (i0, i1) in enumerate(trechos):
         if _comprimento(pontos, 0, i0) < ignorar_inicio:
             continue  # o robo ja esta na entrada ou dentro deste trecho
         g = geometria_passagem(pontos, larg, i0, i1)
+        juncao = analisar_juncao(pontos, larg, trechos, k, g)
+        # cruzamentos retos em sequencia (+ + ...): junta tudo numa passagem so
+        kk = k
+        while juncao is not None and juncao['tipo'] == 'reto':
+            g = dict(g, saida=juncao['saida'], largura=juncao['largura'])
+            kk += 1
+            juncao = analisar_juncao(pontos, larg, trechos, kk, g)
         if any(math.hypot(g['entrada'][0] - ex, g['entrada'][1] - ey) < 0.40
                for ex, ey in ja_tratadas):
             continue
         ax, ay = g['eixo']
         yaw = math.atan2(ay, ax)
         preparo = None
-        for d in (distancia_preparo, distancia_preparo + 0.10, distancia_preparo - 0.10,
-                  distancia_preparo + 0.20, distancia_preparo - 0.15):
-            px, py = g['entrada'][0] - d * ax, g['entrada'][1] - d * ay
-            if pose_livre(mapa, px, py, yaw):
-                preparo = (px, py, yaw, d)
+        # v3.13: as paredes no mapa saem ~6 cm mais grossas que as reais (LiDAR a 4 cm do
+        # chao): tenta mais longe e, por ultimo, sem margem (teste curva2, volta pelo corredor)
+        distancias = (distancia_preparo, distancia_preparo + 0.10, distancia_preparo - 0.10,
+                      distancia_preparo + 0.20, distancia_preparo - 0.15,
+                      distancia_preparo + 0.30, distancia_preparo + 0.40)
+        for margem_p in (0.03, 0.0):
+            for d in distancias:
+                px, py = g['entrada'][0] - d * ax, g['entrada'][1] - d * ay
+                if pose_livre(mapa, px, py, yaw, margem=margem_p):
+                    preparo = (px, py, yaw, d)
+                    break
+            if preparo is not None:
                 break
         if preparo is None:
             return [], 'passagem em (%.2f, %.2f) sem espaco livre para a pose de preparo' % g['entrada']
@@ -233,6 +362,12 @@ def planejar_etapas(mapa, pontos, goal_xy, largura_estreita=0.90, distancia_prep
         # Pose de saida no eixo da passagem. Se a distancia padrao nao estiver livre no mapa,
         # tenta mais perto da saida: sem ela, o robo seguiria direto para o goal final e
         # poderia sair do centro da passagem (aconteceu no teste de 21/10 08:43).
+        if juncao is not None and juncao['tipo'] == 'curva':
+            # v3.11: sem pose de saida pelo Nav2 (o robo sai de lado pelo outro corredor)
+            info = dict(entrada=g['entrada'], saida=g['saida'], eixo_graus=math.degrees(yaw),
+                        largura_mapa=g['largura'], distancia_preparo=preparo[3], curva=juncao,
+                        cruzamentos=kk - k)
+            return etapas, info
         restante_goal = (goal_xy[0] - g['saida'][0]) * ax + (goal_xy[1] - g['saida'][1]) * ay
         for ds in (distancia_saida, 0.35, 0.25, 0.15, 0.0):
             if ds > distancia_saida or restante_goal <= ds + 0.10:
@@ -242,7 +377,7 @@ def planejar_etapas(mapa, pontos, goal_xy, largura_estreita=0.90, distancia_prep
                 etapas.append(dict(tipo='saida', x=sx, y=sy, yaw=yaw))
                 break
         info = dict(entrada=g['entrada'], saida=g['saida'], eixo_graus=math.degrees(yaw),
-                    largura_mapa=g['largura'], distancia_preparo=preparo[3])
+                    largura_mapa=g['largura'], distancia_preparo=preparo[3], cruzamentos=kk - k)
         return etapas, info
     return [], 'nenhuma passagem estreita no caminho'
 
@@ -357,7 +492,7 @@ class Travessia:
                  lateral_cmd=0.02, tol_giro=math.radians(2.0), tol_lateral=0.015,
                  antecipacao_giro=math.radians(2.0), aceita_giro=math.radians(3.0),
                  largura_min=0.66, largura_max=1.00, aprox_max=0.60, ciclos_max=8,
-                 tempo_max=60.0, largura_padrao=0.82, log=print):
+                 tempo_max=60.0, largura_padrao=0.82, parada_lidar=False, log=print):
         self.v_aprox = v_aprox
         self.v_trav = v_travessia
         self.giro_min, self.giro_max = giro_min, giro_max
@@ -390,6 +525,20 @@ class Travessia:
         self.yaw_ref = None
         self.alvo = None
         self.p_aprox_odom = None
+        # v3.12: parar no cruzamento pela parede a frente (o mapa erra ~10-15 cm no eixo do
+        # corredor: SLAM em corredor nao "ve" bem o avanco; teste curva1 de 27/10)
+        self.parada_lidar = parada_lidar
+        self.transv = None         # (t, x da parede em base_link, pose do odom no scan)
+        self.ult_transv = None
+        self.parede_parada = None  # folga do para-choque quando parou
+
+    def nova_transversal(self, t, x_parede, pose):
+        if x_parede is not None:
+            self.transv = (t, x_parede, pose)
+
+    def gap_alvo(self):
+        """Folga para-choque -> parede para o corpo (0,57 m) ficar centrado no corredor novo."""
+        return max(0.08, ((self.largura or self.largura_padrao) - 0.57) / 2.0)
 
     # ------------------------------------------------------------------
     def _boa(self, med):
@@ -575,7 +724,24 @@ class Travessia:
             return 0.0, math.copysign(self.lat_cmd, falta), wz
 
         if e == 'atravessar':
-            if restante <= 0.0:
+            if self.parada_lidar:
+                tv = self.transv
+                if tv is not None and t - tv[0] < 0.8 and restante < 1.0:
+                    dx, _ = self._desloc_robo(tv[2], pose)
+                    gap = tv[1] - dx - 0.365
+                    # o robo anda ~0,1 m/s e o LiDAR atrasa ~0,25 s: para 3 cm antes
+                    if gap <= self.gap_alvo() + 0.03:
+                        self.estado = 'fim'
+                        self.parede_parada = gap
+                        self.log('Parei no cruzamento pelo LiDAR: parede a %.0f cm do para-choque '
+                                 '(alvo %.0f cm; pelo mapa faltavam %+.0f cm)' % (
+                                     gap * 100, self.gap_alvo() * 100, restante * 100))
+                        return 0.0, 0.0, 0.0
+                elif restante <= -0.30:
+                    self.estado = 'fim'
+                    self.log('Sem parede a frente: parei pelo mapa (%.0f cm alem do ponto)' % (-restante * 100))
+                    return 0.0, 0.0, 0.0
+            elif restante <= 0.0:
                 self.estado = 'fim'
                 self.log('Travessia LiDAR concluida')
                 return 0.0, 0.0, 0.0
@@ -597,6 +763,750 @@ class Travessia:
 
 
 # ---------------------------------------------------------------------------
+# v3.11: sair de lado num cruzamento (L, T, +) sem girar (sem ROS)
+# ---------------------------------------------------------------------------
+def _reta_transversal(pts, tol=0.02):
+    """Parede quase perpendicular ao robo (na frente ou atras): x = a + b*y.
+
+    Varre angulos de -15 a +15 graus e fica com a faixa de 3 cm com mais pontos;
+    refina por minimos quadrados. Devolve (a, b, n) ou None."""
+    if len(pts) < 5:
+        return None
+    melhor = None
+    for k in range(-30, 31):
+        th = math.radians(k * 0.5)
+        c, s = math.cos(th), math.sin(th)
+        offs = sorted(p[0] * c - p[1] * s for p in pts)
+        j = 0
+        for i in range(len(offs)):
+            while offs[i] - offs[j] > 0.03:
+                j += 1
+            n = i - j + 1
+            if melhor is None or n > melhor[0]:
+                melhor = (n, th, (offs[i] + offs[j]) / 2.0)
+    _, th, centro = melhor
+    c, s = math.cos(th), math.sin(th)
+    sel = [p for p in pts if abs(p[0] * c - p[1] * s - centro) <= 0.02]
+    for _ in range(2):
+        m = len(sel)
+        if m < 5:
+            return None
+        mx = sum(p[0] for p in sel) / m
+        my = sum(p[1] for p in sel) / m
+        syy = sum((p[1] - my) ** 2 for p in sel)
+        if syy < 1e-4:
+            return None
+        b = sum((p[1] - my) * (p[0] - mx) for p in sel) / syy
+        a = mx - b * my
+        sel = [p for p in sel if abs(p[0] - (a + b * p[1])) < tol]
+    if len(sel) < 5:
+        return None
+    ys = [p[1] for p in sel]
+    if max(ys) - min(ys) < 0.12 or abs(b) > 0.27:
+        return None
+    return a, b, len(sel)
+
+
+def medir_corredor_lateral(pts, lado, largura_conhecida=0.82, centro_corpo=0.08):
+    """Corredor perpendicular ao robo (o robo vai andar de lado, lado=+1 esquerda, -1 direita).
+
+    As paredes do corredor ficam na frente (x > 0) e atras (x < 0) do robo.
+    Devolve dict(angulo, desvio, frente, lados, n) ou None:
+      angulo = quanto girar (rad, + = anti-horario) para ficar perpendicular as paredes;
+      desvio = quanto o centro do corredor esta A FRENTE do centro do corpo (m);
+      frente = folga do para-choque ate a parede da frente (m) ou None.
+    """
+    # so a faixa por onde o robo vai passar (e um pouco para tras): evita a continuacao
+    # do corredor antigo e paredes laterais do cruzamento
+    # v3.14: so a parede ao lado do corpo (e um pouco a frente): perto da saida, pontos
+    # mais longe sao de outras paredes da arena e entortavam a medida (teste curva3 12:07)
+    faixa = [p for p in pts if -0.40 <= p[1] * lado <= 0.70]
+    fr = _reta_transversal([p for p in faixa if 0.40 <= p[0] <= 0.95])
+    # v3.13: a parede de tras so vale perto de onde ela deve estar (frente - largura): no
+    # teste curva2 o ajuste pegava pontos soltos a -0,9 m e o centro pulava +-15 cm
+    if fr:
+        x_tr = fr[0] - largura_conhecida
+        tr = _reta_transversal([p for p in faixa if x_tr - 0.10 <= p[0] <= min(-0.22, x_tr + 0.10)])
+    else:
+        tr = _reta_transversal([p for p in faixa if -0.62 <= p[0] <= -0.22])
+    if tr and (tr[2] < 8 or abs(tr[1]) > 0.10):
+        tr = None
+    if fr and tr and abs(math.atan(fr[1]) - math.atan(tr[1])) > math.radians(6):
+        tr = None
+    if not fr and not tr:
+        return None
+    r = dict(frente=(fr[0] - FOOTPRINT[0][0]) if fr else None)
+    if fr and tr:
+        r['angulo'] = -math.atan((fr[1] * fr[2] + tr[1] * tr[2]) / (fr[2] + tr[2]))
+        r['desvio'] = (fr[0] + tr[0]) / 2.0 - centro_corpo
+        r['largura'] = fr[0] - tr[0]
+        r['lados'], r['n'] = 2, fr[2] + tr[2]
+    elif fr:
+        r['angulo'] = -math.atan(fr[1])
+        r['desvio'] = fr[0] - largura_conhecida / 2.0 - centro_corpo
+        r['largura'] = None
+        r['lados'], r['n'] = 1, fr[2]
+    else:
+        r['angulo'] = -math.atan(tr[1])
+        r['desvio'] = tr[0] + largura_conhecida / 2.0 - centro_corpo
+        r['largura'] = None
+        r['lados'], r['n'] = 1, tr[2]
+    return r
+
+
+def medir_parede_a_frente(pts, lado, x_max=1.6):
+    """v3.12: parede transversal a frente que marca o fim do cruzamento: a parede da frente
+    (L, T vindo da haste) ou a parede do lado de la do corredor novo (+, T pela barra).
+    Devolve x (base_link) da parede na linha do robo, ou None."""
+    sel = [p for p in pts if 0.30 <= p[0] <= x_max and -0.25 <= p[1] * lado <= 1.40]
+    r = _reta_transversal(sel)
+    if r is None:
+        return None
+    return r[0]
+
+
+def folgas_lateral(pts, lado, alcance=0.40):
+    """v3.15: folga real (m) do para-choque e da traseira ate o que estiver na faixa do corpo.
+
+    Devolve (frente, tras, parede_frente, parede_tras): folga = ponto mais perto (None quando
+    nao ha nada a menos de `alcance`); parede_* = os pontos ate 4 cm alem do mais perto cobrem
+    15 cm ou mais de largura (parede de verdade, nao a quina de um cruzamento vista de lado:
+    no curva5 a quina a 18 cm dava "tras 23-26" e o centro brigava com a parede da frente).
+    Nao supoe a largura do corredor: no curva4 a largura real variou de 0,80 a 0,87 m e a
+    medida por uma parede so errava ate 5 cm.
+    """
+    x_fr, x_tr = FOOTPRINT[0][0], FOOTPRINT[2][0]
+    y_max = FOOTPRINT[0][1]
+    fr, tr = [], []
+    for x, y in pts:
+        yl = y * lado
+        if not -y_max <= yl <= y_max + 0.05:
+            continue
+        if x_fr < x <= x_fr + alcance:
+            fr.append((x - x_fr, yl))
+        elif x_tr - alcance <= x < x_tr:
+            tr.append((x_tr - x, yl))
+
+    def lado_(lst):
+        if not lst:
+            return None, False
+        d0 = min(d for d, _ in lst)
+        ys = [yy for d, yy in lst if d <= d0 + 0.04]
+        return d0, len(ys) >= 4 and max(ys) - min(ys) >= 0.15
+
+    f, pf = lado_(fr)
+    r, pr = lado_(tr)
+    return f, r, pf, pr
+
+
+class TravessiaLateral:
+    """Do cruzamento, atravessa o corredor novo andando DE LADO (mecanum), sem girar.
+
+    Estados: assentar -> medir -> (girar | ajustar) -> ... -> deslizar -> fim.
+    Durante o deslize o comando de giro fica em zero: quem segura o rumo e o heading hold
+    da ponte (IMU). Se o centro ou o angulo sairem da tolerancia, para e corrige parado.
+    """
+
+    def __init__(self, lado, v_lateral=0.025, v_ajuste=0.018, giro_min=0.02, giro_max=0.03,
+                 tol_giro=math.radians(3.0), tol_x=0.04, para_x=0.05, para_giro=math.radians(5.0),
+                 antecipacao_giro=math.radians(2.0), frente_min=0.035, largura_padrao=0.82,
+                 correcoes_max=8, tempo_max=90.0, sem_parede_max=0.60, folga_min=0.03,
+                 progresso_reset=0.06, seguranca_max=6, log=print):
+        self.lado = 1.0 if lado > 0 else -1.0
+        self.v_lat, self.v_aj = v_lateral, v_ajuste
+        self.giro_min, self.giro_max = giro_min, giro_max
+        self.tol_giro, self.tol_x = tol_giro, tol_x
+        self.para_x, self.para_giro = para_x, para_giro
+        self.antecipacao = antecipacao_giro
+        self.frente_min = frente_min
+        self.largura = largura_padrao
+        self.correcoes_max = correcoes_max
+        self.tempo_max = tempo_max
+        self.sem_parede_max = sem_parede_max
+        self.log = log
+        self.estado = 'assentar'
+        self.motivo = ''
+        self.t0 = self.t_estado = None
+        self.inicio_estado = None
+        self.meds = []          # (t, med, pose_no_scan)
+        self.correcoes = 0
+        self.alvo = None
+        self.p_inicio = None    # pose do odom no comeco (para sair de re/lado se abortar)
+        self.ult_med_pose = None
+        self.restante = 9.0
+        self.n_bloq = 0
+        self.pulso = 0.0
+        # v3.13: o robo real anda ~0,1 m/s com qualquer comando (PWM minimo): o ajuste para
+        # frente/tras e feito em pulsos curtos, medindo pelo LiDAR entre um e outro
+        # medido no curva3: um pulso de 0,4 s andou ~8 cm (0,2 m/s com rampa e atraso)
+        self.v_real = 0.20
+        self.w_real = 0.26         # rad/s reais com qualquer comando de giro (teste 26/10)
+        self.perto_saida = 0.50    # nos ultimos 0,5 m so sai (as paredes estao acabando)
+        self.yaw_ref = None        # rumo (IMU) depois do 1o alinhamento pelas paredes
+        self.p_desl = None         # pose ao comecar a deslizar (para contar progresso)
+        # v3.15: folga real do para-choque/traseira (folgas_lateral) e parada de seguranca
+        self.folga_min = folga_min
+        self.progresso_reset = progresso_reset
+        self.seguranca_max = seguranca_max
+        self.n_seg = 0
+        self.folga = None          # (t, frente, tras)
+        self._folga_crua = None
+        self.paredes = (False, False)
+        self.p_correcao = None     # pose na ultima correcao (progresso desde ela)
+
+    def nova_folga(self, t, frente, tras, parede_fr=True, parede_tr=True):
+        # vale a maior das 2 ultimas leituras: um scan sozinho (curva4 ida: 2 cm num scan,
+        # 12 cm antes e depois) nao dispara a parada de seguranca
+        def junta(novo, velho):
+            return novo if novo is None or velho is None else max(novo, velho)
+        ult = self._folga_crua
+        self._folga_crua = (frente, tras)
+        if ult is not None:
+            frente, tras = junta(frente, ult[0]), junta(tras, ult[1])
+        self.folga = (t, frente, tras)
+        self.paredes = (parede_fr, parede_tr)
+
+    def _folgas(self, t):
+        """(frente, tras) recentes ou (None, None)."""
+        if self.folga is None or t - self.folga[0] > 0.6:
+            return None, None
+        return self.folga[1], self.folga[2]
+
+    def _centro_folga(self, t):
+        """Quanto o centro do corredor esta a frente do centro do corpo, pelas folgas reais.
+        So quando as duas paredes estao na faixa do corpo (dentro do corredor)."""
+        ff, ft = self._folgas(t)
+        if ff is None or ft is None or ff + ft > 0.40 or not all(self.paredes):
+            return None
+        return (ff - ft) / 2.0
+
+    def _perigo(self, t):
+        """Folga abaixo do minimo: devolve o desvio para se afastar (m) ou None."""
+        ff, ft = self._folgas(t)
+        if ff is not None and ff < self.folga_min:
+            c = self._centro_folga(t)
+            return c if c is not None and c < 0 else -0.04
+        if ft is not None and ft < self.folga_min:
+            c = self._centro_folga(t)
+            return c if c is not None and c > 0 else 0.04
+        return None
+
+    def nova_medicao(self, t, med, pose):
+        if med is None or med['n'] < 6:
+            return
+        # o robo chega alinhado pela travessia (+-3 graus): angulo grande e parede errada
+        # (cruzamento em + ou T com a frente aberta, pontos de outras paredes)
+        if abs(med['angulo']) > math.radians(8):
+            return
+        if med['lados'] == 2 and med['largura'] is not None and 0.66 < med['largura'] < 1.0:
+            self.largura = 0.8 * self.largura + 0.2 * med['largura']
+        self.meds.append((t, med, pose))
+        self.meds = self.meds[-12:]
+        self.ult_med_pose = pose
+
+    def _mudar(self, e, t, pose):
+        if self.estado == 'deslizar' and e != 'deslizar' and self.p_desl is not None:
+            # deslizou antes de parar para corrigir: zera o contador de correcoes
+            # (v3.15: 6 cm; com 15 cm o curva4 abortou a 17 cm do fim depois de 88 cm)
+            if abs(self._desloc(self.p_desl, pose)[1]) >= self.progresso_reset:
+                self.correcoes = 0
+                self.n_seg = 0
+        if e == 'deslizar':
+            self.p_desl = pose
+        self.estado, self.t_estado, self.inicio_estado = e, t, pose
+
+    @staticmethod
+    def _desloc(p0, p1):
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        c, s = math.cos(p0[2]), math.sin(p0[2])
+        return c * dx + s * dy, -s * dx + c * dy
+
+    def abortar(self, motivo):
+        self.estado, self.motivo = 'abortar', motivo
+        self.log('Saida lateral abortada: %s' % motivo)
+
+    def bloqueio(self, t, pose):
+        """Collision Monitor segurando: para, mede e corrige (afasta da parede) antes de desistir."""
+        self.n_bloq += 1
+        if self.n_bloq > 3:
+            self.abortar('Collision Monitor bloqueou %d vezes' % self.n_bloq)
+            return
+        self.log('Collision Monitor segurando em "%s": parando para medir de novo' % self.estado)
+        self._mudar('assentar', t, pose)
+
+    def passo(self, t, pose, restante):
+        """Devolve (vx, vy, wz). restante: metros (no eixo do corredor novo) ate sair dele."""
+        if self.t0 is None:
+            self.t0 = t
+            self.p_inicio = pose
+            self.yaw_ref = pose[2]  # rumo de chegada (alinhado pela travessia)
+            self._mudar('assentar', t, pose)
+            self.log('Cruzamento: saindo de lado para a %s' % ('ESQUERDA' if self.lado > 0 else 'DIREITA'))
+        if self.estado in ('fim', 'abortar'):
+            return 0.0, 0.0, 0.0
+        if t - self.t0 > self.tempo_max:
+            self.abortar('tempo maximo')
+            return 0.0, 0.0, 0.0
+        self.restante = restante
+        e = self.estado
+
+        if e == 'assentar':
+            if t - self.t_estado >= 0.4:
+                self._mudar('medir', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e == 'medir':
+            novas = [m for m in self.meds if m[0] >= self.t_estado]
+            if len(novas) < 3 and t - self.t_estado < 2.0:
+                return 0.0, 0.0, 0.0
+            if not novas and restante < 0.75:
+                # quase fora: as paredes ja acabaram (saida para area aberta); termina de sair
+                self.log('Paredes acabaram perto da saida: terminando de sair')
+                self._mudar('deslizar', t, pose)
+                return 0.0, 0.0, 0.0
+            if not novas:
+                # sem parede agora: segura o rumo pela IMU (rumo do ultimo alinhamento) e segue;
+                # se andar sem_parede_max de lado sem ver parede, o deslize aborta
+                if self.yaw_ref is not None and abs(_ang(self.yaw_ref - pose[2])) > self.tol_giro \
+                        and self.correcoes < self.correcoes_max:
+                    self.correcoes += 1
+                    self.alvo = self.yaw_ref
+                    self.pulso = min(0.40, max(0.05, abs(_ang(self.yaw_ref - pose[2])) / self.w_real - 0.06))
+                    self.log('Sem parede agora: voltando ao rumo pela IMU (%+.1f graus)' % math.degrees(
+                        _ang(self.yaw_ref - pose[2])))
+                    self._mudar('girar', t, pose)
+                    return 0.0, 0.0, 0.0
+                self.log('Sem parede do corredor novo agora: deslizando com o rumo atual')
+                self._mudar('deslizar', t, pose)
+                return 0.0, 0.0, 0.0
+            ang = sorted(m[1]['angulo'] for m in novas)[len(novas) // 2]
+            des = sorted(m[1]['desvio'] for m in novas)[len(novas) // 2]
+            yaw_scan = novas[-1][2][2]
+            fr = [m[1]['frente'] for m in novas if m[1]['frente'] is not None]
+            frente = sorted(fr)[len(fr) // 2] if fr else None
+            # v3.15: com as duas paredes na faixa do corpo, o centro vem das folgas reais
+            ff, ft = self._folgas(t)
+            c_folga = self._centro_folga(t)
+            tol_x = self.tol_x
+            if c_folga is not None:
+                des = c_folga
+            elif novas[-1][1]['lados'] == 1:
+                tol_x = max(self.tol_x, 0.05)   # uma parede so: a largura e suposta
+            self.log('Medicao: girar %+.1f graus, centro %+.1f cm a frente (%s)%s' % (
+                math.degrees(ang), des * 100,
+                'folgas' if c_folga is not None else '%d parede(s)' % novas[-1][1]['lados'],
+                (', folga frente %s / tras %s cm' % ('%.0f' % (ff * 100) if ff is not None else '-',
+                                                     '%.0f' % (ft * 100) if ft is not None else '-'))))
+            perigo = self._perigo(t)
+            if perigo is not None:
+                # perto demais de uma parede: afasta sempre (nao gasta correcao)
+                self.n_seg += 1
+                if self.n_seg > self.seguranca_max:
+                    self.abortar('encostando na parede (%d vezes)' % self.n_seg)
+                    return 0.0, 0.0, 0.0
+                self.log('Perto da parede: afastando %+.1f cm' % (perigo * 100))
+                self.alvo = perigo
+                self.pulso = min(0.30, max(0.08, abs(perigo) / self.v_real))
+                self.p_correcao = pose
+                self._mudar('ajustar', t, pose)
+                return 0.0, 0.0, 0.0
+            pode = self.correcoes < self.correcoes_max
+            # perto da parede da frente (ou de tras) o giro e bloqueado pelo Collision Monitor:
+            # primeiro afasta, depois gira
+            apertado = abs(des) > self.tol_x and (frente is not None and frente < 0.08 or des > 0.07)
+            if pode and abs(ang) > self.tol_giro and not apertado:
+                self.correcoes += 1
+                self.alvo = _ang(yaw_scan + ang)
+                # giro em pulso: o robo gira ~15 graus/s com qualquer comando e ainda embala
+                self.pulso = min(0.40, max(0.05, abs(ang) / self.w_real - 0.06))
+                self._mudar('girar', t, pose)
+            elif pode and abs(des) > tol_x:
+                self.correcoes += 1
+                self.alvo = des
+                self.pulso = min(0.30, max(0.08, abs(des) / self.v_real))
+                self._mudar('ajustar', t, pose)
+            elif abs(ang) <= self.para_giro and abs(des) <= self.para_x:
+                if novas[-1][1]['n'] >= 12:
+                    self.yaw_ref = _ang(yaw_scan + ang)
+                self._mudar('deslizar', t, pose)
+            elif abs(ang) <= math.radians(8):
+                # v3.15: sem correcoes, mas sem perigo (folgas >= 3 cm): segue deslizando;
+                # a parada de seguranca continua valendo
+                self.log('Sem mais correcoes: sigo deslizando (folgas boas)')
+                self._mudar('deslizar', t, pose)
+            else:
+                self.abortar('nao consegui alinhar em %d correcoes' % self.correcoes)
+            return 0.0, 0.0, 0.0
+
+        if e == 'girar':
+            err = _ang(self.alvo - pose[2])
+            if abs(err) < max(math.radians(0.6), self.antecipacao) or t - self.t_estado >= self.pulso:
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            return 0.0, 0.0, math.copysign(self.giro_min, err)
+
+        if e == 'ajustar':
+            # um pulso curto (tempo = erro / velocidade real) e para para medir de novo
+            if t - self.t_estado >= self.pulso:
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            return math.copysign(self.v_aj, self.alvo), 0.0, 0.0
+
+        if e == 'deslizar':
+            if restante <= 0.0:
+                self.estado = 'fim'
+                self.log('Saida lateral concluida')
+                return 0.0, 0.0, 0.0
+            # v3.15: parada de seguranca pela folga real, com ou sem correcoes sobrando
+            if t - self.t_estado > 0.3 and self._perigo(t) is not None:
+                ff, ft = self._folgas(t)
+                self.log('PARADA DE SEGURANCA: folga frente %s / tras %s cm' % (
+                    '%.0f' % (ff * 100) if ff is not None else '-', '%.0f' % (ft * 100) if ft is not None else '-'))
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            novas = [m for m in self.meds if m[0] >= self.t_estado + 0.3]
+            if novas:
+                tm, med, p_scan = novas[-1]
+                # sem correcao pela odom: de lado ela erra x por causa do yaw e da escala
+                c_folga = self._centro_folga(t)
+                if c_folga is not None:
+                    des, lim_x = c_folga, self.para_x
+                elif med['lados'] == 2:
+                    des, lim_x = med['desvio'], self.para_x
+                elif restante > self.perto_saida:
+                    des, lim_x = med['desvio'], 0.07   # uma parede so: a largura e suposta
+                else:
+                    des, lim_x = 0.0, 1.0   # perto da saida, uma parede so: so seguranca e rumo
+                if (abs(med['angulo']) > self.para_giro or abs(des) > lim_x) \
+                        and self.correcoes < self.correcoes_max:
+                    self.log('Corrigindo parado: %+.1f graus, centro %+.1f cm' % (
+                        math.degrees(med['angulo']), des * 100))
+                    self._mudar('assentar', t, pose)
+                    return 0.0, 0.0, 0.0
+            else:
+                _, dy = self._desloc(self.inicio_estado, pose)
+                if abs(dy) > self.sem_parede_max and not [m for m in self.meds if m[0] >= self.t_estado] \
+                        and restante > 0.75:
+                    self.abortar('andei %.2f m de lado sem ver parede' % abs(dy))
+                    return 0.0, 0.0, 0.0
+            # rumo pela IMU entre as medidas (a parede pode sumir perto da saida)
+            erro_rumo = abs(_ang(self.yaw_ref - pose[2])) if self.yaw_ref is not None else 0.0
+            # v3.15: acima de 7 graus a quina do corpo chega na parede: corrige mesmo sem
+            # correcoes sobrando (conta como parada de seguranca)
+            rumo_perigo = erro_rumo > math.radians(7.0)
+            if erro_rumo > self.para_giro and t - self.t_estado > 0.3 \
+                    and (self.correcoes < self.correcoes_max or rumo_perigo):
+                if self.correcoes < self.correcoes_max:
+                    self.correcoes += 1
+                else:
+                    self.n_seg += 1
+                    if self.n_seg > self.seguranca_max:
+                        self.abortar('rumo saindo demais (%d vezes)' % self.n_seg)
+                        return 0.0, 0.0, 0.0
+                self.alvo = self.yaw_ref
+                self.pulso = min(0.40, max(0.05, abs(_ang(self.yaw_ref - pose[2])) / self.w_real - 0.06))
+                self.log('Rumo saiu %+.1f graus (IMU): corrigindo parado' % math.degrees(_ang(pose[2] - self.yaw_ref)))
+                self._mudar('girar', t, pose)
+                return 0.0, 0.0, 0.0
+            return 0.0, self.lado * self.v_lat, 0.0
+        return 0.0, 0.0, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Encostar de frente numa Service Area pelo LiDAR (sem ROS)
+# ---------------------------------------------------------------------------
+def medir_face(pts, x_min=0.30, x_max=1.30, y_lim=0.70, tol=0.02):
+    """Face da mesa a frente do robo (pontos em base_link).
+
+    Devolve dict(dist, ang, centro, span) ou None:
+      dist   = distancia (m) da origem do base_link ate a face, no eixo x do robo
+      ang    = quanto girar (rad, + = anti-horario) para ficar de frente (perpendicular)
+      centro = y do centro da face (m, + = a esquerda) ou None se uma ponta nao aparece
+    """
+    sel = [p for p in pts if x_min <= p[0] <= x_max and abs(p[1]) <= y_lim]
+    if len(sel) < 6:
+        return None
+    # reta x = a + b*y (face quase perpendicular ao robo): varre angulos de -25 a +25 graus
+    melhor = None
+    for k in range(-50, 51):
+        th = math.radians(k * 0.5)
+        c, s = math.cos(th), math.sin(th)
+        offs = sorted((p[0] * c - p[1] * s, p) for p in sel)
+        j = 0
+        for i in range(len(offs)):
+            while offs[i][0] - offs[j][0] > 0.03:
+                j += 1
+            n = i - j + 1
+            # empate: prefere a reta mais proxima (a face, nao a parede atras da mesa)
+            if melhor is None or n > melhor[0] or (n == melhor[0] and offs[j][0] < melhor[2]):
+                melhor = (n, th, offs[j][0], (offs[i][0] + offs[j][0]) / 2.0)
+    n, th, _, centro_off = melhor
+    c, s = math.cos(th), math.sin(th)
+    inl = [p for p in sel if abs(p[0] * c - p[1] * s - centro_off) <= 0.02]
+    for _ in range(2):
+        m = len(inl)
+        if m < 6:
+            return None
+        my = sum(p[1] for p in inl) / m
+        mx = sum(p[0] for p in inl) / m
+        syy = sum((p[1] - my) ** 2 for p in inl)
+        if syy < 1e-4:
+            return None
+        b = sum((p[1] - my) * (p[0] - mx) for p in inl) / syy
+        a = mx - b * my
+        inl = [p for p in sel if abs(p[0] - (a + b * p[1])) < tol]
+    if len(inl) < 6:
+        return None
+    ys = sorted(p[1] for p in inl)
+    span = ys[-1] - ys[0]
+    if span < 0.25:
+        return None
+    # centro so vale se as duas pontas da face aparecem (nao foram cortadas pela janela)
+    centro = None
+    if 0.60 <= span <= 0.98 and ys[0] > -y_lim + 0.05 and ys[-1] < y_lim - 0.05:
+        yc = (ys[0] + ys[-1]) / 2.0
+        xc = a + b * yc
+        # deslocamento do robo ao longo da face (nao muda quando o robo gira no lugar;
+        # o y puro do centro mudava ~1 cm por grau de giro: teste de 22/10 09:36)
+        centro = (yc + xc * b) / math.sqrt(1.0 + b * b)
+    # normal da face no robo: (1, -b) -> girar -atan(b) para ficar perpendicular
+    return dict(dist=a, ang=-math.atan(b), centro=centro, span=span, n=len(inl))
+
+
+class Encosto:
+    def __init__(self, distancia_alvo=0.08, para_choque=0.365, v_aprox=0.02, v_final=0.016,
+                 giro_min=0.02, giro_max=0.03, tol_giro=math.radians(2.0),
+                 antecipacao=math.radians(2.0), tol_lat=0.015, lateral_cmd=0.02,
+                 tempo_max=60.0, log=print):
+        self.alvo = distancia_alvo
+        self.pc = para_choque
+        self.v_aprox, self.v_final = v_aprox, v_final
+        self.giro_min, self.giro_max = giro_min, giro_max
+        self.tol_giro, self.antecip = tol_giro, antecipacao
+        self.tol_lat, self.lat_cmd = tol_lat, lateral_cmd
+        self.tempo_max = tempo_max
+        self.log = log
+        self.estado = 'assentar'
+        self.motivo = ''
+        self.t0 = self.t_estado = None
+        self.ini = None
+        self.meds = []
+        self.ciclos = 0
+        self.n_lat = 0
+        self.avancos = 0
+        self.alvo_giro = self.alvo_lat = self.yaw_ref = None
+        self.resultado = None
+        self.p_dur = 0.15      # duracao do pulso de avanco final (s), ajustada sozinha
+        self.p_ult = None
+        self.n_pulsos = 0
+
+    def nova_medicao(self, t, med, pose):
+        if med is not None:
+            self.meds.append((t, med, pose))
+            self.meds = self.meds[-12:]
+
+    def abortar(self, motivo):
+        self.estado, self.motivo = 'abortar', motivo
+        self.log('Encosto abortado: %s' % motivo)
+
+    def bloqueio(self, t, pose):
+        """Collision Monitor segurando: perto da mesa e esperado no avanco final."""
+        if self.estado in ('avancar', 'pulso'):
+            self.log('Collision Monitor parou o avanco: medindo onde ficou')
+            self._mudar('assentar_final', t, pose)
+        else:
+            self.abortar('Collision Monitor bloqueando em "%s"' % self.estado)
+
+    def _mudar(self, e, t, pose):
+        self.estado, self.t_estado, self.ini = e, t, pose
+
+    def _novas(self, desde):
+        return [m for m in self.meds if m[0] >= desde]
+
+    @staticmethod
+    def _desloc(p0, p1):
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        c, s = math.cos(p0[2]), math.sin(p0[2])
+        return c * dx + s * dy, -s * dx + c * dy
+
+    def passo(self, t, pose):
+        if self.t0 is None:
+            self.t0 = t
+            self._mudar('assentar', t, pose)
+        if self.estado in ('fim', 'abortar'):
+            return 0.0, 0.0, 0.0
+        if t - self.t0 > self.tempo_max:
+            self.abortar('tempo maximo')
+            return 0.0, 0.0, 0.0
+        e = self.estado
+
+        if e in ('assentar', 'assentar_final'):
+            if t - self.t_estado >= 0.4:
+                self._mudar('medir' if e == 'assentar' else 'medir_final', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e in ('medir', 'medir_final'):
+            novas = self._novas(self.t_estado)
+            if len(novas) < 4 and t - self.t_estado < 3.0:
+                return 0.0, 0.0, 0.0
+            if len(novas) < 2:
+                self.abortar('nao vejo a face da mesa a frente')
+                return 0.0, 0.0, 0.0
+            med = lambda k: sorted(m[1][k] for m in novas)[len(novas) // 2]
+            dist, ang = med('dist'), med('ang')
+            centros = [m[1]['centro'] for m in novas if m[1]['centro'] is not None]
+            centro = sorted(centros)[len(centros) // 2] if len(centros) >= 2 else None
+            folga = dist - self.pc
+            yaw_scan = novas[-1][2][2]
+            if e == 'medir_final':
+                self.resultado = dict(folga=folga, ang=ang, centro=centro)
+                self.log('Encostado: frente a %.1f cm da mesa, %.1f graus, centro %s' % (
+                    folga * 100, math.degrees(ang),
+                    ('%+.1f cm' % (centro * 100)) if centro is not None else 'nao medido'))
+                if folga > self.alvo + 0.025 and self.avancos < 3:
+                    self.avancos += 1
+                    self.yaw_ref = _ang(yaw_scan + ang)
+                    self._mudar('avancar', t, pose)
+                    return 0.0, 0.0, 0.0
+                self.estado = 'fim'
+                return 0.0, 0.0, 0.0
+            self.ciclos += 1
+            self.log('Medicao %d: face a %.0f cm (para-choque), girar %+.1f graus, centro %s' % (
+                self.ciclos, folga * 100, math.degrees(ang),
+                ('%+.1f cm' % (centro * 100)) if centro is not None else 'nao visto'))
+            if folga < 0.03:
+                self.abortar('ja esta perto demais da mesa (%.0f cm)' % (folga * 100))
+                return 0.0, 0.0, 0.0
+            pode = self.ciclos <= 10
+            if pode and abs(ang) > self.tol_giro:
+                self.alvo_giro = _ang(yaw_scan + ang)
+                self._mudar('girar', t, pose)
+            elif pode and centro is not None and abs(centro) > self.tol_lat and self.n_lat < 5:
+                self.n_lat += 1
+                self.alvo_lat = centro
+                self._mudar('deslocar', t, pose)
+            elif abs(ang) > math.radians(3.0) or (centro is not None and abs(centro) > 0.04):
+                self.abortar('nao consegui alinhar com a mesa (%.1f graus, centro %+.1f cm)' % (
+                    math.degrees(ang), (centro or 0.0) * 100))
+            else:
+                self.yaw_ref = _ang(yaw_scan + ang)
+                self.log('Alinhado com a mesa: avancando ate %.0f cm' % (self.alvo * 100))
+                self._mudar('avancar', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e == 'girar':
+            err = _ang(self.alvo_giro - pose[2])
+            if abs(err) < max(math.radians(0.6), self.antecip) or t - self.t_estado > 8.0:
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            return 0.0, 0.0, _sat(0.5 * err, self.giro_min, self.giro_max)
+
+        if e == 'deslocar':
+            # Lateral em pulsos medidos pelo LiDAR: com comando pequeno o robo desliza ~15 cm/s
+            # e passava do centro (teste de 22/10 09:36: -5 cm virou +5 cm num deslize so).
+            self.l_ult = None
+            self.l_pulsos = 0
+            self.l_dur = 0.15
+            self.l_falta = self.alvo_lat
+            self.l_yaw = pose[2]
+            self._mudar('lat_pulso', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e == 'lat_pulso':
+            if t - self.t_estado >= self.l_dur:
+                self._mudar('lat_esperar', t, pose)
+                return 0.0, 0.0, 0.0
+            err = _ang(self.l_yaw - pose[2])
+            wz = _sat(0.5 * err, 0.016, 0.03) if abs(err) > math.radians(0.8) else 0.0
+            return 0.0, math.copysign(self.lat_cmd, self.l_falta), wz
+
+        if e == 'lat_esperar':
+            novas = [m for m in self._novas(self.t_estado + 0.2) if m[1]['centro'] is not None]
+            if (len(novas) < 2 or t - self.t_estado < 0.5) and t - self.t_estado < 3.0:
+                return 0.0, 0.0, 0.0
+            self.l_pulsos += 1
+            if not novas or self.l_pulsos >= 8:
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            c = sorted(m[1]['centro'] for m in novas[-3:])[len(novas[-3:]) // 2]
+            if abs(c) < self.tol_lat:
+                self._mudar('assentar', t, pose)
+                return 0.0, 0.0, 0.0
+            if c * self.l_falta < 0:
+                self.l_dur = max(0.10, self.l_dur * 0.5)  # passou do centro: volta com pulso menor
+            else:
+                andou = abs(self.l_falta) - abs(c)
+                if andou > 0.003:
+                    novo = 0.5 * abs(c) / (andou / self.l_dur)
+                else:
+                    novo = self.l_dur * 1.4
+                self.l_dur = min(max(novo, 0.10), self.l_dur * 1.4, 0.30)
+            self.l_falta = c
+            self._mudar('lat_pulso', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e == 'avancar':
+            # Avanco continuo ate ~6 cm antes do alvo, freando pelo LiDAR (o odom nao serve:
+            # com comando pequeno o robo anda ate 2x o que o odom diz - teste de 22/10 08:45).
+            novas = self._novas(self.t_estado)
+            if novas:
+                tl, med, _ = novas[-1]
+                folga = med['dist'] - self.pc
+                v = 0.0
+                if len(novas) >= 2:
+                    t0_, m0, _ = novas[-2]
+                    if tl - t0_ > 0.05:
+                        v = max(0.0, ((m0['dist'] - self.pc) - folga) / (tl - t0_))
+                previsto = folga - v * (t - tl + 0.35)  # 0.35 s = atraso + parada
+            else:
+                folga = previsto = 9.0
+            if previsto <= self.alvo + 0.08 or t - self.t_estado > 15.0:
+                self.p_ult = None
+                self.n_pulsos = 0
+                self._mudar('esperar', t, pose)
+                return 0.0, 0.0, 0.0
+            err = _ang(self.yaw_ref - pose[2])
+            wz = _sat(0.4 * err, 0.016, 0.03) if abs(err) > math.radians(1.0) else 0.0
+            return self.v_aprox, 0.0, wz
+
+        if e == 'esperar':
+            # parado: mede a folga com 2 leituras novas e decide o proximo pulso
+            novas = self._novas(self.t_estado + 0.2)
+            if (len(novas) < 2 or t - self.t_estado < 0.5) and t - self.t_estado < 3.0:
+                return 0.0, 0.0, 0.0
+            if not novas:
+                self.abortar('perdi a face da mesa')
+                return 0.0, 0.0, 0.0
+            folga = sorted(m[1]['dist'] for m in novas[-3:])[len(novas[-3:]) // 2] - self.pc
+            falta = folga - self.alvo
+            if falta <= 0.012 or self.n_pulsos >= 12:
+                self._mudar('assentar_final', t, pose)
+                return 0.0, 0.0, 0.0
+            if self.p_ult is not None:
+                andou = self.p_ult - folga
+                # o robo quase nao anda abaixo de ~0.15 s e depois dispara (pulso de 0.40 s
+                # andou 6.6 cm no teste de 09:36): cresce no maximo 40% por vez, ate 0.30 s
+                if andou > 0.003:
+                    taxa = andou / self.p_dur
+                    novo = 0.5 * falta / taxa
+                else:
+                    novo = self.p_dur * 1.4
+                self.p_dur = min(max(novo, 0.10), self.p_dur * 1.4, 0.30)
+            self.p_ult = folga
+            self.n_pulsos += 1
+            self.log('Folga %.1f cm: pulso %d de %.2f s' % (folga * 100, self.n_pulsos, self.p_dur))
+            self._mudar('pulso', t, pose)
+            return 0.0, 0.0, 0.0
+
+        if e == 'pulso':
+            if t - self.t_estado >= self.p_dur:
+                self._mudar('esperar', t, pose)
+                return 0.0, 0.0, 0.0
+            return self.v_final, 0.0, 0.0
+        return 0.0, 0.0, 0.0
+
+
+# ---------------------------------------------------------------------------
 # No ROS 2
 # ---------------------------------------------------------------------------
 
@@ -614,6 +1524,7 @@ def main():
     from nav2_msgs.action import ComputePathToPose, NavigateToPose
     from nav2_msgs.msg import CollisionMonitorState
     from sensor_msgs.msg import LaserScan
+    from std_msgs.msg import String
     from tf2_ros import Buffer, TransformListener
 
     def yaw_de(q):
@@ -642,6 +1553,23 @@ def main():
             # False = para fora da passagem e avisa (o DWB dentro da passagem so piora)
             self.declare_parameter('fallback_nav2', False)
             self.declare_parameter('largura_passagem', 0.82)  # usada quando so uma parede aparece
+            # v3.5: ir ate uma Service Area e encostar de frente
+            self.declare_parameter('arquivo_areas', os.path.expanduser('~/mapas/service_areas.yaml'))
+            self.declare_parameter('distancia_encosto', 0.08)   # para-choque ate a face (m)
+            self.declare_parameter('para_choque', 0.365)        # frente do robo em base_link (m)
+            self.declare_parameter('recuo_saida', 0.25)         # re ao sair da mesa (odom)
+            # v3.11: cruzamentos. Na curva o robo sai de lado (mecanum) pelo corredor novo.
+            self.declare_parameter('vel_lateral', 0.025)        # comando (o robo real anda ~3.4x)
+            self.declare_parameter('margem_saida_lateral', 0.40)  # centro alem da saida do corredor
+            self.declare_parameter('centro_corpo', 0.08)        # centro do corpo a frente do base_link
+            self.area_pendente = None
+            self.encostado = False
+            self.declare_parameter('arquivo_pontos', os.path.expanduser('~/mapas/pontos.yaml'))
+            self.sem_encosto = set()
+            # v3.10: chegada em ponto sem mesa: aceita quando fica tempo_chegada s a menos de
+            # raio_chegada m do ponto, sem esperar o Nav2 acertar o angulo
+            self.declare_parameter('raio_chegada', 0.10)
+            self.declare_parameter('tempo_chegada', 1.5)
             grupo = ReentrantCallbackGroup()
             self.cm_stop = False
             self.odom = None          # (t, x, y, yaw)
@@ -659,6 +1587,10 @@ def main():
             self.create_subscription(CollisionMonitorState, '/collision_monitor_state',
                                      self.ao_cm, 10, callback_group=grupo)
             self.pub_cmd = self.create_publisher(TwistStamped, '/cmd_vel_nav', 10)
+            # v3.8: resultado de cada /ir_para_area, para missoes nao dependerem dos logs:
+            #   "WS_1 SUCESSO folga=8.2cm ang=+0.5 centro=+1.0cm"  ou  "WS_1 FALHOU <motivo>"
+            self.pub_resultado = self.create_publisher(String, '/ir_para_area/resultado', 10)
+            self.res_area = None
             self.lock = threading.Lock()
             self.mapa_msg = None
             self.plano = None
@@ -673,6 +1605,8 @@ def main():
             self.create_subscription(Path, '/plan', self.ao_plano, 5, callback_group=grupo)
             self.create_subscription(PoseStamped, self.get_parameter('topico_goal').value,
                                      self.ao_goal, 10, callback_group=grupo)
+            self.create_subscription(String, '/ir_para_area', self.ao_ir_area, 10,
+                                     callback_group=grupo)
             self.pub_poses = self.create_publisher(PoseArray, '/alinhador/etapas', 1)
             self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose', callback_group=grupo)
             self.plan = ActionClient(self, ComputePathToPose, 'compute_path_to_pose',
@@ -701,10 +1635,57 @@ def main():
                 return
             with self.lock:
                 self.goal_pendente = msg
+                self.area_pendente = None
             self.evento.set()
             self._cancelar_nav()
             self.get_logger().info('Novo goal: x=%.2f y=%.2f yaw=%.0f graus' % (
                 msg.pose.position.x, msg.pose.position.y, math.degrees(yaw_de(msg.pose.orientation))))
+
+        def ao_ir_area(self, msg):
+            nome = msg.data.strip().upper()
+            caminho = self.p('arquivo_areas')
+            try:
+                import yaml
+                with open(caminho) as fa:
+                    areas = (yaml.safe_load(fa) or {}).get('service_areas') or {}
+            except Exception as exc:
+                self.get_logger().error('Nao consegui ler %s: %s' % (caminho, exc))
+                return
+            area = areas.get(nome) or areas.get(nome.replace('_', ''))
+            # v3.9: pontos sem mesa (START, FINISH...) ficam em ~/mapas/pontos.yaml:
+            # o robo so vai ate a pose, sem encostar
+            pontos = {}
+            try:
+                with open(self.p('arquivo_pontos')) as fp:
+                    pontos = (yaml.safe_load(fp) or {}).get('pontos') or {}
+            except OSError:
+                pass
+            except Exception as exc:
+                self.get_logger().warn('Nao consegui ler %s: %s' % (self.p('arquivo_pontos'), exc))
+            if (area is None or 'aproximacao' not in area) and nome in pontos:
+                area = {'aproximacao': pontos[nome]}
+                self.sem_encosto.add(nome)
+            else:
+                self.sem_encosto.discard(nome)
+            if area is None or 'aproximacao' not in area:
+                self.get_logger().error('Area %s nao esta em %s nem em %s (tem: %s)' % (
+                    nome, caminho, self.p('arquivo_pontos'),
+                    ', '.join(list(areas) + list(pontos)) or 'nenhuma'))
+                with self.lock:
+                    self.res_area = nome
+                m = String()
+                m.data = '%s FALHOU area desconhecida' % nome
+                self.pub_resultado.publish(m)
+                return
+            ap = area['aproximacao']
+            goal = self._pose(ap['x'], ap['y'], ap['yaw'])
+            with self.lock:
+                self.goal_pendente = goal
+                self.area_pendente = nome
+            self.evento.set()
+            self._cancelar_nav()
+            self.get_logger().info('Indo para %s: aproximacao em x=%.2f y=%.2f yaw=%.0f graus' % (
+                nome, ap['x'], ap['y'], math.degrees(ap['yaw'])))
 
         def ao_odom(self, msg):
             p = msg.pose.pose
@@ -803,8 +1784,11 @@ def main():
                 return None
             return [(ps.pose.position.x, ps.pose.position.y) for ps in r.result.path.poses]
 
-        def _navegar(self, alvo, nome, vigia=None):
-            """Devolve 'ok', 'falha' ou 'interrompido' (vigia pediu para parar)."""
+        def _navegar(self, alvo, nome, vigia=None, aceitar_perto=False):
+            """Devolve 'ok', 'falha' ou 'interrompido' (vigia pediu para parar).
+
+            aceitar_perto (v3.10): 'ok' quando o robo fica tempo_chegada s a menos de
+            raio_chegada m do alvo, cancelando o Nav2 (o angulo final nao importa)."""
             if not self.nav.wait_for_server(timeout_sec=5.0):
                 self.get_logger().error('navigate_to_pose indisponivel')
                 return 'falha'
@@ -821,10 +1805,28 @@ def main():
             futuro = h.get_result_async()
             try:
                 proxima = time.monotonic() + self.p('periodo_vigia')
+                perto_desde = None
                 while True:
                     r = self._esperar(futuro, 0.2)
                     if r is not None:
                         break
+                    if aceitar_perto:
+                        pm = self._pose_mapa()
+                        if pm is not None and math.hypot(pm[0] - alvo.pose.position.x,
+                                                         pm[1] - alvo.pose.position.y) <= self.p('raio_chegada'):
+                            perto_desde = perto_desde or time.monotonic()
+                            if time.monotonic() - perto_desde >= self.p('tempo_chegada'):
+                                h.cancel_goal_async()
+                                self._esperar(futuro, 5.0)
+                                self._parar()
+                                self.get_logger().info(
+                                    '%s: SUCESSO (aceito a %.0f cm do ponto, sem exigir angulo%s)' % (
+                                        nome, 100 * math.hypot(pm[0] - alvo.pose.position.x,
+                                                               pm[1] - alvo.pose.position.y),
+                                        ', Collision Monitor em STOP' if self.cm_stop else ''))
+                                return 'ok'
+                        else:
+                            perto_desde = None
                     if vigia is not None and time.monotonic() >= proxima:
                         proxima = time.monotonic() + self.p('periodo_vigia')
                         if vigia():
@@ -857,13 +1859,27 @@ def main():
                 return None
             return tr.transform.translation.x, tr.transform.translation.y
 
-        def _travessia_lidar(self, info, nome):
-            """Devolve 'ok' ou 'falha' (o chamador cai para a travessia pelo Nav2)."""
+        def _pose_mapa_yaw(self):
+            try:
+                tr = self.tf_buffer.lookup_transform('map', 'base_link', Time())
+            except Exception:
+                return None
+            return (tr.transform.translation.x, tr.transform.translation.y,
+                    yaw_de(tr.transform.rotation))
+
+        def _travessia_lidar(self, info, nome, parada=None, lado=None):
+            """Devolve 'ok' ou 'falha' (o chamador cai para a travessia pelo Nav2).
+
+            parada (v3.11): (x, y) no mapa onde o CENTRO do robo deve parar (cruzamento com
+            curva), em vez de passar margem_saida alem da saida."""
             sx, sy = info['saida']
             ax, ay = math.cos(math.radians(info['eixo_graus'])), math.sin(math.radians(info['eixo_graus']))
             margem = self.p('margem_saida')
+            if parada is not None:
+                sx, sy = parada
+                margem = 0.0
             trav = Travessia(v_aprox=self.p('vel_aproximacao'), v_travessia=self.p('vel_travessia'),
-                             largura_padrao=self.p('largura_passagem'),
+                             largura_padrao=self.p('largura_passagem'), parada_lidar=lado is not None,
                              log=lambda m: self.get_logger().info('%s: %s' % (nome, m)))
             self.get_logger().info('%s: travessia pelo LiDAR ate (%.2f, %.2f) + %.2f m' % (
                 nome, sx, sy, margem))
@@ -886,6 +1902,11 @@ def main():
                         med = medir_corredor(sc[1], largura_conhecida=trav.largura or
                                              self.p('largura_passagem'))
                         trav.nova_medicao(sc[0], med, sc[2], sc[3])
+                        if lado is not None and trav.estado == 'atravessar' and restante < 1.0:
+                            # parede esperada (pelo mapa) a restante + centro_corpo + meia largura
+                            x_esp = restante + self.p('centro_corpo') + (trav.largura or 0.82) / 2.0
+                            trav.nova_transversal(sc[0], medir_parede_a_frente(
+                                sc[1], lado, x_max=max(0.6, x_esp + 0.35)), sc[2])
                     pm = self._pose_mapa()
                     if pm is None:
                         sem_tf_desde = sem_tf_desde or agora
@@ -927,6 +1948,129 @@ def main():
                         self._recuar(avancou, od[3], nome)
             self.get_logger().info('%s (LiDAR): %s' % (nome, 'SUCESSO' if ok else 'FALHOU - ' + trav.motivo))
             return 'ok' if ok else 'falha'
+
+        def _travessia_lateral(self, curva, nome):
+            """v3.11: do cruzamento, sai de lado pelo corredor novo. Devolve 'ok' ou 'falha'."""
+            bx, by = curva['eixo_b']
+            sx, sy = curva['saida_b']
+            margem = self.p('margem_saida_lateral')
+            with self.lock:
+                od0 = self.odom
+            pm0 = self._pose_mapa()
+            dist = (margem - ((pm0[0] - sx) * bx + (pm0[1] - sy) * by)) if pm0 else 2.5
+            tl = TravessiaLateral(curva['lado'], v_lateral=self.p('vel_lateral'),
+                                  largura_padrao=self.p('largura_passagem'),
+                                  tempo_max=40.0 + 30.0 * max(0.5, dist),
+                                  log=lambda m: self.get_logger().info('%s: %s' % (nome, m)))
+            self.get_logger().info('%s: saindo de lado para a %s ate (%.2f, %.2f) + %.2f m' % (
+                nome, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA', sx, sy, margem))
+            seq = self.scan_seq
+            bloqueado_desde = None
+            sem_tf_desde = None
+            restante = 9.0
+            try:
+                while rclpy.ok():
+                    if self._novo_goal_chegou():
+                        raise Cancelado()
+                    agora = time.monotonic()
+                    with self.lock:
+                        od, sc, sq, cf = self.odom, self.scan, self.scan_seq, self.cmd_final
+                    if od is None or agora - od[0] > 0.5:
+                        tl.abortar('sem /odom recente')
+                        break
+                    if sq != seq and sc is not None and sc[2] is not None:
+                        seq = sq
+                        tl.nova_medicao(sc[0], medir_corredor_lateral(
+                            sc[1], tl.lado, tl.largura, self.p('centro_corpo')), sc[2])
+                        tl.nova_folga(sc[0], *folgas_lateral(sc[1], tl.lado))
+                    pm = self._pose_mapa()
+                    if pm is None:
+                        sem_tf_desde = sem_tf_desde or agora
+                        if agora - sem_tf_desde > 1.0:
+                            tl.abortar('sem TF map->base_link')
+                            break
+                    else:
+                        sem_tf_desde = None
+                        restante = margem - ((pm[0] - sx) * bx + (pm[1] - sy) * by)
+                    vx, vy, wz = tl.passo(agora, od[1:], restante)
+                    if tl.estado in ('fim', 'abortar'):
+                        break
+                    self._publicar_vel(vx, vy, wz)
+                    mandando = abs(vx) >= 0.015 or abs(vy) >= 0.015 or abs(wz) >= 0.015
+                    if mandando and (self.cm_stop or agora - cf[0] > 0.5 or cf[1]):
+                        bloqueado_desde = bloqueado_desde or agora
+                        if agora - bloqueado_desde > 1.5:
+                            bloqueado_desde = None
+                            tl.bloqueio(agora, od[1:])
+                            if tl.estado == 'abortar':
+                                break
+                    else:
+                        bloqueado_desde = None
+                    time.sleep(0.05)
+            finally:
+                self._parar()
+            ok = tl.estado == 'fim'
+            self.get_logger().info('%s: %s' % (nome, 'SUCESSO' if ok else 'FALHOU - ' + tl.motivo))
+            return 'ok' if ok else 'falha'
+
+        def _encostar(self, nome):
+            """Da pose de aproximacao: alinha com a face pelo LiDAR e avanca ate a distancia."""
+            enc = Encosto(distancia_alvo=self.p('distancia_encosto'), para_choque=self.p('para_choque'),
+                          log=lambda m: self.get_logger().info('ENCOSTAR %s: %s' % (nome, m)))
+            self.get_logger().info('ENCOSTAR %s: medindo a face da mesa' % nome)
+            seq = self.scan_seq
+            bloqueado_desde = None
+            try:
+                while rclpy.ok():
+                    if self._novo_goal_chegou():
+                        raise Cancelado()
+                    agora = time.monotonic()
+                    with self.lock:
+                        od, sc, sq, cf = self.odom, self.scan, self.scan_seq, self.cmd_final
+                    if od is None or agora - od[0] > 0.5:
+                        enc.abortar('sem /odom recente')
+                        break
+                    if sq != seq and sc is not None and sc[2] is not None:
+                        seq = sq
+                        enc.nova_medicao(sc[0], medir_face(sc[1]), sc[2])
+                    vx, vy, wz = enc.passo(agora, od[1:])
+                    if enc.estado in ('fim', 'abortar'):
+                        break
+                    self._publicar_vel(vx, vy, wz)
+                    mandando = abs(vx) >= 0.015 or abs(vy) >= 0.015 or abs(wz) >= 0.015
+                    if mandando and (self.cm_stop or agora - cf[0] > 0.5 or cf[1]):
+                        bloqueado_desde = bloqueado_desde or agora
+                        if agora - bloqueado_desde > 1.5:
+                            bloqueado_desde = None
+                            enc.bloqueio(agora, od[1:])
+                            if enc.estado == 'abortar':
+                                break
+                    else:
+                        bloqueado_desde = None
+                    time.sleep(0.05)
+            finally:
+                self._parar()
+            if enc.estado == 'fim':
+                self.encostado = True
+                self.get_logger().info('ENCOSTAR %s: SUCESSO' % nome)
+                r = enc.resultado or {}
+                det = 'folga=%.1fcm ang=%+.1f centro=%s' % (
+                    r.get('folga', 0.0) * 100, math.degrees(r.get('ang', 0.0)),
+                    ('%+.1fcm' % (r['centro'] * 100)) if r.get('centro') is not None else 'nd')
+                self._publicar_resultado(nome, True, det)
+            else:
+                self.get_logger().warn('ENCOSTAR %s: FALHOU - %s' % (nome, enc.motivo))
+                # se ficou perto da mesa, o proximo goal tambem sai de re antes de girar
+                if enc.meds and enc.meds[-1][1]['dist'] - enc.pc < 0.25:
+                    self.encostado = True
+                self._publicar_resultado(nome, False, 'encosto: %s' % enc.motivo)
+
+        def _publicar_resultado(self, nome, ok, texto):
+            self.res_area = nome
+            m = String()
+            m.data = '%s %s %s' % (nome, 'SUCESSO' if ok else 'FALHOU', texto)
+            self.pub_resultado.publish(m)
+            self.get_logger().info('RESULTADO: %s' % m.data)
 
         def _recuar(self, distancia, yaw_alvo, nome):
             """Re reta segurando o yaw pelo IMU (distancia em unidades do odom)."""
@@ -980,16 +2124,33 @@ def main():
                 self.evento.wait(0.5)
                 with self.lock:
                     goal = self.goal_pendente
+                    area = self.area_pendente
                     self.goal_pendente = None
+                    self.area_pendente = None
                     self.evento.clear()
                 if goal is None:
                     continue
                 try:
-                    self.executar(goal)
+                    if self.encostado:
+                        # de frente para a mesa a 8 cm, girar bate a quina: sai de re reto antes
+                        self.encostado = False
+                        with self.lock:
+                            od = self.odom
+                        if od is not None:
+                            self._recuar(self.p('recuo_saida'), od[3], 'SAIR DA MESA')
+                    self.res_area = None
+                    self.executar(goal, area)
+                    if area is not None and self.res_area is None:
+                        self._publicar_resultado(area, False, 'nao chegou na pose de aproximacao '
+                                                 '(navegacao, preparo ou passagem falhou)')
                 except Cancelado:
                     self.get_logger().info('Goal substituido por um novo.')
+                    if area is not None and self.res_area is None:
+                        self._publicar_resultado(area, False, 'cancelado por outro goal')
                 except Exception as exc:
                     self.get_logger().error('Erro: %s' % exc)
+                    if area is not None and self.res_area is None:
+                        self._publicar_resultado(area, False, 'erro: %s' % exc)
 
         def _analisar(self, gx, gy, tratadas, pontos=None, goal=None):
             mapa = self._mapa()
@@ -1001,7 +2162,7 @@ def main():
                                    self.p('distancia_preparo'), self.p('distancia_saida'),
                                    ja_tratadas=tratadas)
 
-        def executar(self, goal):
+        def executar(self, goal, area=None):
             gx, gy = goal.pose.position.x, goal.pose.position.y
             tratadas = []
             alerta = {}
@@ -1062,13 +2223,40 @@ def main():
                         self.get_logger().warn('Preparo falhou: seguindo para o goal final.')
                     elif self.p('modo_travessia') == 'lidar':
                         n = len(tratadas)
-                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n)
+                        curva = info.get('curva')
+                        parada = None
+                        if curva is not None:
+                            # v3.11: para no cruzamento com o corpo centrado no corredor novo
+                            ax_ = math.cos(math.radians(info['eixo_graus']))
+                            ay_ = math.sin(math.radians(info['eixo_graus']))
+                            jx, jy = curva['juncao']
+                            parada = (jx - self.p('centro_corpo') * ax_, jy - self.p('centro_corpo') * ay_)
+                            self.get_logger().info(
+                                'Passagem %d termina num cruzamento em (%.2f, %.2f) com curva para a %s: '
+                                'paro no cruzamento e saio de lado (sem girar)' % (
+                                    n, jx, jy, 'ESQUERDA' if curva['lado'] > 0 else 'DIREITA'))
+                        elif info.get('cruzamentos'):
+                            self.get_logger().info('Passagem %d atravessa %d cruzamento(s) reto(s): '
+                                                   'uma travessia so ate (%.2f, %.2f)' % (
+                                                       n, info['cruzamentos'], info['saida'][0],
+                                                       info['saida'][1]))
+                        lado_c = curva['lado'] if curva is not None else None
+                        r = self._travessia_lidar(info, 'TRAVESSIA %d' % n, parada, lado_c)
                         if r != 'ok':
                             self.get_logger().warn('Travessia pelo LiDAR falhou: voltando ao preparo '
                                                    'para tentar de novo.')
                             if self._navegar(self._pose(e['x'], e['y'], e['yaw']),
                                              'PREPARO %d (2a tentativa)' % n) == 'ok':
-                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n)
+                                r = self._travessia_lidar(info, 'TRAVESSIA %d (2a tentativa)' % n, parada, lado_c)
+                        if r == 'ok' and curva is not None:
+                            r = self._travessia_lateral(curva, 'CURVA %d' % n)
+                            if r == 'ok':
+                                tratadas.append(curva['entrada_b'])
+                                continue  # reanalisa o caminho a partir da saida do corredor novo
+                            self.get_logger().error(
+                                'Nao consegui sair de lado pelo corredor novo (curva %d). Parei; ajude o '
+                                'robo e mande o goal de novo.' % n)
+                            return
                         if r == 'ok':
                             continue  # reanalisa o caminho a partir da saida
                         if not (self.p('fallback_nav2') and len(etapas) > 1):
@@ -1092,9 +2280,23 @@ def main():
                 else:
                     self.get_logger().info('Analise: %s.' % info)
                 # goal final, vigiando o caminho para passagens que aparecerem no mapa
+                livre = area is not None and area in self.sem_encosto
+                if livre:
+                    # v3.10: ponto sem mesa: angulo de chegada pelo caminho, nada de giro final
+                    yaw = yaw_chegada(self._caminho(goal), (gx, gy), self._pose_mapa_yaw())
+                    if yaw is not None:
+                        self.get_logger().info('%s: angulo livre, usando o de chegada (%.0f graus)' % (
+                            area, math.degrees(yaw)))
+                        goal = self._pose(gx, gy, yaw)
                 resultado = self._navegar(goal, 'GOAL FINAL',
-                                          vigia if len(tratadas) < int(self.p('max_passagens')) else None)
+                                          vigia if len(tratadas) < int(self.p('max_passagens')) else None,
+                                          aceitar_perto=livre)
                 if resultado != 'interrompido':
+                    if resultado == 'ok' and area is not None:
+                        if area in self.sem_encosto:
+                            self._publicar_resultado(area, True, 'chegou (ponto sem mesa)')
+                        else:
+                            self._encostar(area)
                     return
 
     rclpy.init()
