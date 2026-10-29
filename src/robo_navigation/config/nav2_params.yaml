@@ -14,16 +14,25 @@ controller_server:
     controller_plugins:
     - FollowPath
     progress_checker:
-      plugin: nav2_controller::SimpleProgressChecker
-      required_movement_radius: 0.05
-      movement_time_allowance: 12.0
+      plugin: "nav2_controller::PoseProgressChecker"  # RECUPERACAO_RAPIDA
+      required_movement_radius: 0.03
+      movement_time_allowance: 6.0
+      required_movement_angle: 0.17
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       stateful: true
       xy_goal_tolerance: 0.06
       yaw_goal_tolerance: 0.035
     FollowPath:
-      plugin: dwb_core::DWBLocalPlanner
+      plugin: "nav2_rotation_shim_controller::RotationShimController"  # ROTATION_SHIM
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      angular_dist_threshold: 0.785        # gira antes se o caminho estiver a mais de 45 graus
+      forward_sampling_distance: 0.5       # direcao do caminho medida 0.5 m a frente
+      rotate_to_heading_angular_vel: 0.40  # GIRO_RAPIDO: ~25 graus/s real (teste 26/10)
+      max_angular_accel: 0.8
+      simulate_ahead_time: 1.0             # confere colisao do giro
+      closed_loop: false                   # usa o ultimo comando (a odom nao mede bem o giro)
+      rotate_to_heading_once: true         # GIRO_UMA_VEZ: so no comeco de cada goal
       debug_trajectory_details: true
       min_vel_x: -0.08
       max_vel_x: 0.08
@@ -236,19 +245,19 @@ velocity_smoother:
     max_velocity:
     - 0.08
     - 0.08
-    - 0.14
+    - 0.40  # GIRO_RAPIDO (era 0.14; o DWB continua limitado a 0.14)
     min_velocity:
     - -0.08
     - -0.08
-    - -0.14
+    - -0.40
     max_accel:
     - 0.2
     - 0.2
-    - 0.2
+    - 0.8
     max_decel:
     - -0.5
     - -0.5
-    - -0.5
+    - -1.2  # GIRO_UMA_VEZ: para o giro rapido em ~0.3 s
     odom_topic: /odom
     odom_duration: 0.1
     deadband_velocity:
@@ -289,6 +298,8 @@ collision_monitor:
       - backward
       - right
       - stopped
+      - giro_esq
+      - giro_dir
 
       # Movimento predominantemente para frente:
       # -45 graus ate +45 graus.
@@ -298,8 +309,8 @@ collision_monitor:
         linear_max: 0.20
         direction_start_angle: -0.785
         direction_end_angle: 0.785
-        theta_min: -0.20
-        theta_max: 0.20
+        theta_min: -0.60
+        theta_max: 0.60
 
       # Movimento para a esquerda:
       # +45 graus ate +135 graus.
@@ -309,8 +320,8 @@ collision_monitor:
         linear_max: 0.20
         direction_start_angle: 0.785
         direction_end_angle: 2.356
-        theta_min: -0.20
-        theta_max: 0.20
+        theta_min: -0.60
+        theta_max: 0.60
 
       # Movimento predominantemente de re:
       # +135 graus passando por pi ate -135 graus.
@@ -320,8 +331,8 @@ collision_monitor:
         linear_max: 0.20
         direction_start_angle: 2.356
         direction_end_angle: -2.356
-        theta_min: -0.20
-        theta_max: 0.20
+        theta_min: -0.60
+        theta_max: 0.60
 
       # Movimento para a direita:
       # -135 graus ate -45 graus.
@@ -331,8 +342,8 @@ collision_monitor:
         linear_max: 0.20
         direction_start_angle: -2.356
         direction_end_angle: -0.785
-        theta_min: -0.20
-        theta_max: 0.20
+        theta_min: -0.60
+        theta_max: 0.60
 
       # Fallback para robo parado ou rotacao praticamente pura.
       # Aproxima o circulo varrido pelos cantos do footprint.
@@ -344,6 +355,26 @@ collision_monitor:
         direction_end_angle: 3.1415
         theta_min: -0.20
         theta_max: 0.20
+
+      # GIRO_RAPIDO: giro parado acima de 0.20 rad/s (RotationShim a 0.40).
+      # 7 cm de margem em volta do footprint (o stopped tem 4 cm).
+      giro_esq:
+        points: "[[0.435, 0.385], [0.435, -0.385], [-0.275, -0.385], [-0.275, 0.385]]"
+        linear_min: 0.0
+        linear_max: 0.005
+        direction_start_angle: -3.1415
+        direction_end_angle: 3.1415
+        theta_min: 0.20
+        theta_max: 0.60
+
+      giro_dir:
+        points: "[[0.435, 0.385], [0.435, -0.385], [-0.275, -0.385], [-0.275, 0.385]]"
+        linear_min: 0.0
+        linear_max: 0.005
+        direction_start_angle: -3.1415
+        direction_end_angle: 3.1415
+        theta_min: -0.60
+        theta_max: -0.20
 
     observation_sources:
     - scan
