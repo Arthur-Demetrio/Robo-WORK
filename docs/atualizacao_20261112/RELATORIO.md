@@ -25,7 +25,7 @@ Os commits e autores anteriores são preservados. Os novos commits de consolida�
 
 A IA não concluiu as nove réplicas no momento desta captura. O relatório publicado não deve ser tratado como recomendação final. A execução interrompida do primeiro lançamento foi preservada no diretório `interrupcoes`, e a bateria relançada de forma independente manteve as condições pareadas de partida.
 
-Para conferir integridade, baixar os quatro arquivos e `SHA256SUMS` e executar `sha256sum -c SHA256SUMS`. O manifesto permite conferir individualmente os arquivos capturados. A atualização não modifica processos ou worktrees operacionais.
+Para conferir integridade, baixar todos os assets da release e executar `sha256sum -c SHA256SUMS`. O manifesto permite conferir individualmente os arquivos capturados. A atualização não modifica processos ou worktrees operacionais.
 
 Saídas de compilação residuais encontradas entre evidências históricas foram mantidas somente nos arquivos da release, sem objetos C/C++ no Git navegável.
 

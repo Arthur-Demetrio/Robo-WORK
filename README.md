@@ -47,7 +47,7 @@ Os [arquivos da release `snapshot-20261112`](../../releases/tag/snapshot-2026111
 | `robo-work-referencia-historicos-git-20261112.tar.gz` | Cópia local de referência e bundles dos históricos Git locais |
 | `manifesto.json`, `SHA256SUMS` | Caminhos, tamanhos, hashes SHA-256 e política de captura |
 
-Os caminhos dos três primeiros arquivos correspondem aos diretórios do repositório; podem ser extraídos em uma **cópia separada** para restaurar os dados completos. O quarto usa `repositorio_local/` e `historicos_git/`. Confira `SHA256SUMS` antes de extrair. Para o piloto, o arquivo completo da IA também restaura as fixtures/checkpoints e bibliotecas nativas usados pelos testes, que não são todos incluídos no Git navegável.
+Os caminhos dos três primeiros arquivos correspondem aos diretórios do repositório; podem ser extraídos em uma **cópia separada** para restaurar os dados completos. O quarto usa `repositorio_local/` e `historicos_git/`. Baixe também os metadados da release e confira `SHA256SUMS` antes de extrair. Para o piloto, o arquivo completo da IA também restaura as fixtures/checkpoints e bibliotecas nativas usados pelos testes, que não são todos incluídos no Git navegável.
 
 Ambientes virtuais, caches, instalações e saídas de build, configurações locais de ferramentas e arquivos de credenciais foram excluídos e registrados no manifesto. O diretório colcon `log/` é derivado; os logs de ensaio `logs/`, bags e relatórios permanecem nos arquivos completos. Os arquivos originais de trabalho não foram substituídos.
 
