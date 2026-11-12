@@ -6,7 +6,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction
 from launch.event_handlers import OnProcessStart
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, IfElseSubstitution
 from launch_ros.actions import Node
 
 
@@ -40,6 +41,8 @@ def generate_launch_description():
 
     common_parameters = [
         params_file,
+        IfElseSubstitution(LaunchConfiguration('virtual_walls'),
+            os.path.join(navigation_share, 'config', 'virtual_wall_filters.yaml'), params_file),
         {"use_sim_time": use_sim_time},
     ]
     common_remappings = [
@@ -93,6 +96,12 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument('virtual_walls', default_value='false',
+                                  description='Enable calibrated tape keepout masks'),
+            Node(package='robo_virtual_wall', executable='tape_keepout',
+                 name='tape_keepout', output='screen',
+                 condition=IfCondition(LaunchConfiguration('virtual_walls')),
+                 parameters=[{'use_sim_time': use_sim_time}]),
             DeclareLaunchArgument(
                 "use_sim_time",
                 default_value="false",

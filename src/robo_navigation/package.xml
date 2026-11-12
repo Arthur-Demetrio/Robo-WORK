@@ -31,4 +31,5 @@
     <build_type>ament_cmake</build_type>
   </export>
   <exec_depend>robo_recovery</exec_depend>
+  <exec_depend>robo_virtual_wall</exec_depend>
 </package>
