@@ -1,0 +1,12 @@
+scan_filter:
+  ros__parameters:
+    input_topic: /scan_raw
+    output_topic: /scan_front
+    invert_angles: true
+    blocked_intervals_deg: ""  # CORPO_REAL_M35: autorretorno vira NaN so dentro do corpo, sem cegar obstaculos alem
+    body_filter_enabled: true
+    body_laser_x: 0.330
+    body_laser_y: 0.005
+    body_laser_yaw: 0.0
+    force_out_of_range_to_inf: true
+    use_sim_time: false

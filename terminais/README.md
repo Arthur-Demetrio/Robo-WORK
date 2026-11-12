@@ -110,3 +110,19 @@ ros2 topic list
 - O `ROS_DOMAIN_ID=0` corresponde ao ambiente usado nas últimas sessões.
 - Comandos antigos de ROS 2 Humble e `~/ros2_ws` não devem ser misturados com estes do Jazzy.
 - Caso os nomes dos launch files tenham mudado, revisar os arquivos reais no notebook antes de atualizar esta documentação.
+
+## Validacao da fita
+
+`08-validar-fita.sh` abre camera/TF/RViz. Nao inicia a base ROS. Se o frame map
+nao existe porque a base esta parada, `09-base-validacao-fita.sh` abre os quatro
+scripts operacionais 01–04 (hardware, LiDAR, localizacao e mapeamento), sem Nav2
+ou comandos de deslocamento. Nao iniciar instancias duplicadas. Os scripts 01–04
+usam o workspace operacional `~/robo_jazzy_ws`; a camera usa `~/Robo-WORK`. Ambos
+usam ROS_DOMAIN_ID=0. Erros nos terminais da base devem ser corrigidos antes de
+prosseguir: abrir as janelas por si so nao garante existencia de TF/mapa.
+
+`11-ativar-fita-nav2.sh` inicia a visão métrica, máscara e Nav2 usando o launch e
+parâmetros operacionais, mais RViz com máscara/costmaps. Requer base ROS em execução.
+Encerra apenas a instância anterior da câmera e recusa Nav2 duplicado. Conferir
+primeiro a parede parado. Ver `src/robo_virtual_wall/NAV2.md` para o escopo das
+conferências físicas registradas e os limites da calibração.
