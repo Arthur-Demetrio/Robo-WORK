@@ -2,6 +2,15 @@
 
 Robô móvel omnidirecional com rodas mecanum, ROS 2 Jazzy, Nav2, LiDAR e IMU. Este repositório reúne o desenvolvimento operacional, as análises e o treinamento em simulação.
 
+## Parede virtual por fita — 13/11/2026
+
+O funcionamento conferido no robô está separado em
+[modulos/parede_virtual_nav2](modulos/parede_virtual_nav2/README.md), com pacote
+ROS 2, calibração ampliada, HSV, integração Nav2 e instruções próprias. Confirma
+a fita após três observações e remove a parede após ausência prolongada somente
+com o robô parado e o trecho visível; mantém a memória ao se afastar. Sem máscaras
+da garra. Este módulo não altera as versões históricas ou instalações operacionais.
+
 ## Atualização consolidada — 12/11/2026
 
 Esta versão consolida as mudanças locais posteriores à atualização de outubro, mantendo o histórico anterior. A publicação foi preparada com a conta **OttavioSilva**. Os arquivos são um snapshot: não constituem confirmação de implantação no hardware nem prova de navegação robusta.
