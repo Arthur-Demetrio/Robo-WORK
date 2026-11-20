@@ -19,7 +19,7 @@ do LiDAR com o robo parado (ou, no giro, o yaw da IMU).
 """
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 try:
     import numpy as np
@@ -446,7 +446,15 @@ class Config:
     deriva_lateral: float = 0.40       # avanco por metro de deslize (06/11: 0,31-0,37; folga a mais)
     giro_max: float = 0.70             # limite do smart_spin
     re_max: float = 0.15
+    sem_caminho_unico: bool = False    # SEM_CAMINHO_UNICO (13/11): espera de 2x2 s so na 1a chamada no lugar
     continuacao: float = 0.15          # o corpo precisa andar isto na direcao do caminho depois
+    # ORIENTAR_CAMINHO (13/11): giro de orientacao para o caminho (False = como antes: so a varredura de 40 graus)
+    giro_orientar: bool = False
+    giro_orientar_max: float = 2 * math.pi      # giro acumulado maximo (pelo outro lado: 360 - |angulo|)
+    giro_orientar_wz: float = 0.20              # rad/s (o DWB usa ate 0,20; o motor gira parado no minimo ~0,15)
+    giro_orientar_tol: float = math.radians(20.0)   # sobra aceita no fim (o DWB acerta o resto andando)
+    giro_orientar_reavaliar: int = 0            # v2 ORIENTAR_ROBUSTO: paradas p/ reavaliar o arco (0 = v1: aborta)
+    giro_abertura: bool = False        # GIRO_ABERTURA_20261116: opt-in; caminho atual + continuacao comprovada
 
 
 @dataclass
@@ -477,6 +485,45 @@ DWB_DIRECAO_MAX = math.radians(95)   # vx 0..0,20 e vy +-0,08: o DWB so anda de 
 
 def _lateral_movs(dy, k):
     return [(0.0, dy, 0.0), (k * abs(dy), dy, 0.0)]
+
+
+def _giro_abertura(es, cfg):
+    """GIRO_ABERTURA_20261116: compara poses, sem aliviar margem ou cobertura."""
+    if (not es.planner_ok or es.ang_caminho is None or not es.cm_ativo or not es.exclusivo
+            or not cfg.permitir_giro or 'giro' in es.bloqueadas):
+        return None
+    pts, ang = es.raios.pontos(), es.ang_caminho
+    if cm_barraria(pts, 'stopped'):
+        return None
+    f0 = folga_direcao(pts, math.cos(ang), math.sin(ang), alcance=0.50)
+    opcoes = []
+    for graus in (-40, -30, -20, -10, 10, 20, 30, 40):
+        giro = math.radians(graus)
+        novo_ang = ang_norm(ang - giro)
+        if abs(giro) > cfg.giro_max + 1e-9 or abs(novo_ang) > DWB_DIRECAO_MAX:
+            continue
+        c, s = math.cos(giro), math.sin(giro)
+        lx, ly, lt = es.raios.laser
+        # A foto permanece a mesma; pontos e origem do laser mudam juntos de referencial.
+        foto = replace(es.raios, angle_min=es.raios.angle_min - giro,
+                       laser=(c * lx + s * ly, -s * lx + c * ly, lt))
+        f1 = folga_direcao(foto.pontos(), math.cos(novo_ang), math.sin(novo_ang), alcance=0.50)
+        if f1 < cfg.continuacao or f1 < f0 + 0.04:
+            continue
+        continuacao = avaliar(foto, [(cfg.continuacao * math.cos(novo_ang),
+                                     cfg.continuacao * math.sin(novo_ang), 0.0)],
+                              cobertura_min=cfg.cobertura_lateral)
+        if not continuacao.livre:
+            continue
+        varredura = avaliar(es.raios, [(0.0, 0.0, giro)], margem=0.045,
+                            cobertura_min=cfg.cobertura_giro)
+        if varredura.livre:
+            opcoes.append((f1, -abs(giro), giro, varredura.cobertura))
+    if not opcoes:
+        return None
+    f1, _, giro, cobertura = max(opcoes)
+    return {'giro_graus': math.degrees(giro), 'folga_antes_m': f0,
+            'folga_depois_m': f1, 'cobertura': cobertura}
 
 
 def decidir(es, cfg=None, plano_contornar=None):
@@ -593,6 +640,43 @@ def decidir(es, cfg=None, plano_contornar=None):
         rec.append(('mover', 'corpo nao passa 10 cm + continuacao na direcao do caminho'))
     elif 'mover' in es.bloqueadas:
         rec.append(('mover', 'ja tentado aqui sem resultado'))
+
+    # GIRO_ABERTURA_20261116: apos falharem as translacoes, antes da recusa dos 45 graus.
+    if cfg.giro_abertura:
+        abertura = _giro_abertura(es, cfg)
+        if abertura is not None:
+            g = math.radians(abertura['giro_graus'])
+            return Decisao('giro', (0.0, 0.0, g),
+                           'abertura %+.0f graus: continuacao no caminho de %.0f para %.0f cm; area %.0f%% observada' % (
+                               abertura['giro_graus'], 100 * abertura['folga_antes_m'],
+                               100 * abertura['folga_depois_m'], 100 * abertura['cobertura']),
+                           rec, {'abertura': abertura, 'ang_caminho': ang})
+
+    # ---- ORIENTAR_CAMINHO (13/11): giro de ORIENTACAO (ficar de frente para o caminho). A varredura do smart_spin
+    # (abaixo) para na 1a abertura frontal e no maximo 40 graus: no bag de 13/11 11:41 girou 7 de 162 graus.
+    # So com caminho ATUAL do planner (skill robo-work-nav-melhoria: nada de giro por rota nao validada).
+    if cfg.giro_orientar and cfg.permitir_giro and ang is not None and abs(ang) >= math.radians(45):
+        if not es.planner_ok:
+            rec.append(('orientar', 'planner sem caminho agora: nao giro por direcao antiga'))
+        elif 'orientar' in es.bloqueadas:
+            rec.append(('orientar', 'ja tentei orientar aqui sem resultado'))
+        elif cm_barraria(pts, 'stopped'):
+            rec.append(('orientar', 'o Collision Monitor barraria (ponto a < 3 cm do corpo)'))
+        else:
+            mot = []
+            longo = ang - math.copysign(2 * math.pi, ang)
+            for g, lado in ((ang, 'pelo lado curto'), (longo, 'pelo outro lado')):
+                if abs(g) > cfg.giro_orientar_max + 1e-9:
+                    mot.append('%+.0f graus %s: acima do limite de %.0f' % (
+                        math.degrees(g), lado, math.degrees(cfg.giro_orientar_max)))
+                    continue
+                av = avaliar(es.raios, [(0.0, 0.0, g)], margem=0.045, cobertura_min=cfg.cobertura_giro)
+                if av.livre:
+                    return Decisao('orientar', (0.0, 0.0, g), 'gira %+.0f graus %s para ficar de frente para o '
+                                   'caminho (%+.0f); area %.0f%% observada' % (
+                                       math.degrees(g), lado, math.degrees(ang), 100 * av.cobertura), rec)
+                mot.append('%+.0f graus %s: %s' % (math.degrees(g), lado, av.motivo))
+            rec.append(('orientar', '; '.join(mot)))
 
     # ---- ETAPA F: giro (pelo smart_spin)
     if not cfg.permitir_giro:
@@ -878,6 +962,95 @@ class Recuperador:
         motivo, dl = self.transladar(1.0, 0.0, g.AVANCO, 0.10, t_fim)
         return True, 'venci: %.0f cm de lado (odom) e %.0f cm para frente (%s)' % (100 * lat, 100 * dl[0], motivo)
 
+    def girar_orientar(self, g, t_fim):
+        """ORIENTAR_CAMINHO (13/11): gira g rad parado (sentido fixo), medindo pelo yaw da IMU ACUMULADO.
+        A cada scan novo confere o arco dos proximos 30 graus (corpo + 3 cm) pelo LiDAR. Para por: chegou (falta
+        < 3 graus), cancelamento, tempo, sensor parado, comando estrangeiro, controlador comandando, Collision
+        Monitor (na hora), LiDAR no arco seguinte ou IMU sem progresso por 2 s. -> (motivo, girou_rad)"""
+        io, cfg = self.io, self.cfg
+        sentido = 1.0 if g > 0 else -1.0
+        yaw_ant = io.odom()[3]
+        girou, ult_scan, motivo = 0.0, None, 'chegou'
+        reav = 0                           # v2 ORIENTAR_ROBUSTO: paradas para reavaliar o arco
+        wz = 0.15
+        t_ini = io.agora()
+        t_prog = t_ini
+        t_lim = min(t_ini + 3.0 + abs(g) / 0.10, t_fim + 10.0)
+        while True:
+            agora = io.agora()
+            od = io.odom()
+            d = ang_norm(od[3] - yaw_ant)
+            yaw_ant = od[3]
+            girou += d
+            if abs(d) > 0.003:
+                t_prog = agora
+            falta = g - girou
+            if falta * sentido <= math.radians(3.0):
+                break
+            if io.cancelado():
+                motivo = 'cancelado'
+                break
+            if agora >= t_lim:
+                motivo = 'tempo'
+                break
+            if not self._sensores_ok():
+                motivo = 'sensor parado'
+                break
+            e = io.ultimo_estrangeiro()
+            if e is not None and agora - e < 0.3:
+                motivo = 'comando estrangeiro em /cmd_vel_nav'
+                break
+            c = io.ultimo_ctrl()
+            if c is not None and agora - c < 0.3:
+                motivo = 'controlador comandando'
+                break
+            if io.cm_stop():
+                motivo = 'Collision Monitor parou'
+                break
+            if agora - t_prog > 2.0 and agora - t_ini > 2.0:
+                motivo = 'IMU sem progresso angular (giro nao comecou ou travou)'
+                break
+            sc = io.scan()
+            if sc.t != ult_scan:
+                ult_scan = sc.t
+                prox = sentido * min(abs(falta), math.radians(30.0))
+                av = avaliar(sc, [(0.0, 0.0, prox)], margem=0.03)
+                if not av.livre and reav < cfg.giro_orientar_reavaliar:
+                    # v2 ORIENTAR_ROBUSTO (teste 13/11 13:17:34): 1 ponto num scan tirado GIRANDO derrubou o giro
+                    # com 6 de 164 graus, embora a foto parada desse a area livre. Agora: para, foto PARADA e
+                    # reavalia o arco que FALTA com o mesmo criterio do inicio. O CM continua parando na hora.
+                    reav += 1
+                    io.parar()
+                    foto = self.foto(t_lim)
+                    od = io.odom()
+                    girou += ang_norm(od[3] - yaw_ant)
+                    yaw_ant = od[3]
+                    falta = g - girou
+                    if foto is None:
+                        motivo = 'LiDAR: %s no arco seguinte (sem foto parada para reavaliar)' % av.motivo
+                        break
+                    av2 = avaliar(foto, [(0.0, 0.0, falta)], margem=0.045, cobertura_min=cfg.cobertura_giro)
+                    io.log('info' if av2.livre else 'warn',
+                           'ORIENTAR_ROBUSTO %d: girando vi %s; parado, o arco que falta (%+.0f graus) %s' % (
+                               reav, av.motivo, math.degrees(falta),
+                               'esta livre: continuo' if av2.livre else 'NAO esta livre (%s): paro' % av2.motivo))
+                    if not av2.livre:
+                        motivo = 'LiDAR (parado): %s no arco que falta' % av2.motivo
+                        break
+                    ult_scan, t_prog, t_ini = foto.t, io.agora(), io.agora()
+                    continue
+                if not av.livre:
+                    motivo = 'LiDAR: %s no arco seguinte' % av.motivo
+                    break
+                folgado = avaliar(sc, [(0.0, 0.0, prox)], margem=0.07).livre
+                wz = cfg.giro_orientar_wz if folgado and abs(falta) > math.radians(15.0) else 0.15
+            io.enviar(0.0, 0.0, sentido * wz)
+            io.dormir(0.05)
+        io.parar()
+        io.dormir(0.3)                     # o motor ainda gira um pouco depois do zero
+        girou += ang_norm(io.odom()[3] - yaw_ant)
+        return motivo, girou
+
     # ---------------- a chamada
     def executar(self, dist=0.25, vcmd=0.03, tmax=15.0, chamador_oscilou=False):
         """-> (ok, mensagem, relatorio)"""
@@ -909,7 +1082,12 @@ class Recuperador:
         jan = io.janela()
         planner = io.replanejar()
         tent = 0
-        while planner is False and tent < 2 and io.agora() < t_fim - 6.0:
+        # SEM_CAMINHO_UNICO (13/11): voltando ao mesmo lugar, a espera ja foi feita e nao trouxe caminho
+        tent_max = 0 if (cfg.sem_caminho_unico and retornos >= 1) else 2
+        if planner is False and tent_max == 0:
+            io.log('info', 'SEM CAMINHO de novo no mesmo lugar (%da chamada aqui): nao repito a espera de '
+                           '2 x 2 s; vou direto as manobras' % (retornos + 1))
+        while planner is False and tent < tent_max and io.agora() < t_fim - 6.0:
             # BLOQUEIO_LOCAL do v3 + SEM_CAMINHO (10/11): no bag de 10/11 a passagem fechou por paredes
             # fantasmas (SLAM saltando); limpa, espera PARADO a localizacao assentar e o costmap remarcar
             io.soltar_bloqueio()
@@ -959,7 +1137,11 @@ class Recuperador:
                 marcou = True
             o0 = io.odom()
             manobras += 1
-            if dec.acao == 'giro':
+            if dec.acao == 'orientar':      # ORIENTAR_CAMINHO (13/11): o proprio destravar gira
+                motivo, self._orientar_girou = self.girar_orientar(dec.mov[2], t_fim)
+                ok_mov = motivo == 'chegou'
+                motivo = 'orientar: ' + motivo
+            elif dec.acao == 'giro':
                 ok_mov, txt_mov = io.smart_spin(dec.mov[2], max(3.0, min(12.0, t_fim - io.agora() - 2.0)))
                 motivo = 'smart_spin: ' + txt_mov
             elif dec.acao == 'contornar':
@@ -975,16 +1157,32 @@ class Recuperador:
             if io.cancelado():
                 self.hist.registrar(io.agora(), ref[0], ref[1], dec.acao, 'falhou', 'cancelado')
                 return fim(False, 'cancelado durante %s' % dec.acao)
-            foto1 = self.foto(t_fim + 2.0)
+            foto1 = self.foto(t_fim + 2.0 if dec.acao != 'orientar' else max(t_fim, io.agora()) + 2.0)
             o1 = io.odom()
             if foto1 is None:
                 self.hist.registrar(io.agora(), ref[0], ref[1], dec.acao, 'nao_verificado', 'sem foto')
                 return fim(False, '%s sem foto depois: resultado nao verificado' % dec.acao)
             # ---- verificacao com evidencia independente da odometria
-            if dec.acao == 'giro':
+            if dec.acao == 'orientar':
+                girou = self._orientar_girou
+                falta = dec.mov[2] - girou
+                ok = girou * dec.mov[2] > 0 and abs(falta) <= cfg.giro_orientar_tol
+                evid = 'IMU: girou %+.0f de %+.0f graus (falta %+.0f)' % (
+                    math.degrees(girou), math.degrees(dec.mov[2]), math.degrees(falta))
+            elif dec.acao == 'giro':
                 dyaw = ang_norm(o1[3] - o0[3])
                 ok = ok_mov and abs(dyaw) >= 0.08 and dyaw * dec.mov[2] > 0
                 evid = 'IMU: girou %+.0f graus' % math.degrees(dyaw)
+                if 'abertura' in dec.extra:
+                    a1 = ang_norm(dec.extra['ang_caminho'] - dyaw)
+                    f1 = folga_direcao(foto1.pontos(), math.cos(a1), math.sin(a1), alcance=0.50)
+                    av1 = avaliar(foto1, [(cfg.continuacao * math.cos(a1),
+                                          cfg.continuacao * math.sin(a1), 0.0)],
+                                  cobertura_min=cfg.cobertura_lateral)
+                    ok = (ok and f1 >= cfg.continuacao and av1.livre and
+                          f1 >= dec.extra['abertura']['folga_antes_m'] + 0.04)
+                    evid += '; abertura medida: %.0f cm, continuacao %s' % (100 * f1, 'livre' if av1.livre else av1.motivo)
+
             else:
                 med = medir_deslocamento(pts0, foto1.pontos(), self._delta_odom(o0, o1))
                 mov_real = dec.mov
