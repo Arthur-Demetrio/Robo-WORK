@@ -245,12 +245,22 @@ def main():
             g = ReentrantCallbackGroup()
             self.g = g
             self.lock = threading.Lock()
-            for nome, valor in (('permitir_lateral', True), ('permitir_giro', True), ('permitir_re', False),
-                                ('cobertura_lateral', 0.5), ('cobertura_giro', 0.5), ('cobertura_re', 0.9),
-                                ('deriva_lateral', 0.4)):
+            # RE_LIBERADA (12/11): permitir_re era False (re bloqueada ate validacao fisica); pedido do usuario
+            for nome, valor in (('permitir_lateral', True), ('permitir_giro', True), ('permitir_re', True),
+                                # RE_LONGA (12/11): cobertura_re era 0.9 (traseira so 66-71% visivel); re_max era 0.15
+                                ('cobertura_lateral', 0.5), ('cobertura_giro', 0.5), ('cobertura_re', 0.65),
+                                ('deriva_lateral', 0.4), ('re_max', 0.30)):
+                self.declare_parameter(nome, valor)
+            # ORIENTAR_CAMINHO (13/11): giro de orientacao para o caminho (false = como antes)
+            for nome, valor in (('giro_orientar', True), ('giro_orientar_max_graus', 360.0),
+                                ('giro_orientar_wz', 0.20),
+                                # v2 ORIENTAR_ROBUSTO: paradas para reavaliar o arco (0 = v1: aborta no 1o ponto)
+                                ('giro_orientar_reavaliar', 3)):
                 self.declare_parameter(nome, valor)
             self.pts = None
             self.raios = None
+            self.declare_parameter('giro_abertura', False)  # GIRO_ABERTURA_20261116: opt-in
+            self.declare_parameter('sem_caminho_unico', False)   # SEM_CAMINHO_UNICO (13/11): opt-in
             self.odom = None
             self.plano = None      # (t, [(x, y)] no map)
             self.plano_msg = None
@@ -566,9 +576,18 @@ def main():
                             cobertura_lateral=float(self.get_parameter('cobertura_lateral').value),
                             cobertura_giro=float(self.get_parameter('cobertura_giro').value),
                             cobertura_re=float(self.get_parameter('cobertura_re').value),
-                            deriva_lateral=float(self.get_parameter('deriva_lateral').value))
+                            deriva_lateral=float(self.get_parameter('deriva_lateral').value),
+                            re_max=max(0.10, min(0.40, float(self.get_parameter('re_max').value))))   # RE_LONGA
+            # ORIENTAR_CAMINHO (13/11): wz limitado a 0,15-0,20 (nunca mais rapido que o DWB)
+            cfg.giro_abertura = bool(self.get_parameter('giro_abertura').value)  # GIRO_ABERTURA_20261116
+            cfg.giro_orientar = bool(self.get_parameter('giro_orientar').value)
+            cfg.giro_orientar_max = math.radians(max(0.0, min(360.0, float(
+                self.get_parameter('giro_orientar_max_graus').value))))
+            cfg.giro_orientar_wz = max(0.15, min(0.20, float(self.get_parameter('giro_orientar_wz').value)))
+            cfg.giro_orientar_reavaliar = max(0, min(5, int(self.get_parameter('giro_orientar_reavaliar').value)))
             self.gh_atual = gh
             res = DriveOnHeading.Result()
+            cfg.sem_caminho_unico = bool(self.get_parameter('sem_caminho_unico').value)   # SEM_CAMINHO_UNICO (13/11)
             try:
                 ok, msg, _ = ra.Recuperador(IoRos(self), geo, cfg, self.hist).executar(dist, vcmd, tmax)
             except Exception as exc:  # nunca deixa o robo andando

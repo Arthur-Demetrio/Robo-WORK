@@ -152,6 +152,11 @@ def main():
             self.declare_parameter('entrada', '/scan_front')
             self.declare_parameter('saida', '/scan_nav')
             self.declare_parameter('margem', 0.0)
+            # MEMORIA_OFF (19/11 noite, pedido do usuario): memoria do ponto cego desligada por padrao.
+            # Ela fazia copias da face da mesa/parede aparecerem mais perto que a real (odom no encosto e no
+            # deslize) e seguravam o CM (missao19: encosto WS_1 41 s; 12/11: 4,3 cm com a parede a 14).
+            # Religar na hora: ros2 param set /filtro_corpo_scan memoria_perto true
+            self.declare_parameter('memoria_perto', False)
             self.laser = None
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -165,8 +170,9 @@ def main():
             self.n_injetados = 0
             self.create_subscription(Odometry, '/odom', self.ao_odom, 20)
             self.create_timer(10.0, self.resumo)
-            self.get_logger().info('Filtro do corpo: %s -> %s' % (
-                self.get_parameter('entrada').value, self.get_parameter('saida').value))
+            self.get_logger().info('Filtro do corpo: %s -> %s; MEMORIA_PERTO %s' % (
+                self.get_parameter('entrada').value, self.get_parameter('saida').value,
+                'LIGADA' if self.get_parameter('memoria_perto').value else 'DESLIGADA (MEMORIA_OFF)'))
 
         def ao_odom(self, m):
             q = m.pose.pose.orientation
@@ -186,7 +192,10 @@ def main():
                     return  # sem TF ainda: nao publica (o CM para o robo, que e o seguro)
             ranges, removidos = filtrar(msg.ranges, msg.angle_min, msg.angle_increment, self.laser,
                                         self.get_parameter('margem').value)
-            if self.odom is not None:
+            usar_memoria = bool(self.get_parameter('memoria_perto').value)   # MEMORIA_OFF
+            if not usar_memoria and self.memoria.pts:
+                self.memoria.pts.clear()   # religada depois, comeca sem copias velhas
+            if usar_memoria and self.odom is not None:
                 import time as _t
                 for idx, rl in self.memoria.passo(_t.monotonic(), self.odom, msg.ranges, msg.angle_min,
                                                   msg.angle_increment, self.laser):

@@ -30,6 +30,18 @@ TAU_GIRO = 0.12  # SUAV_V2: era 0.25
 TIMEOUT = 0.3
 
 
+def comando_corredor(vx, vy, wz, fator):
+    """Escala a translação continuamente, inclusive nas correções diagonais."""
+    if fator == 0.0:
+        return 0.0, 0.0, 0.0
+    # O giro puro precisa vencer a zona morta angular. Durante translação,
+    # a partir de 0,02 rad/s a ponte distingue giro pedido de retenção de rumo.
+    # Um ajuste angular não deve acelerar a translação.
+    piso_giro = 0.0201 if (vx or vy) and abs(wz) >= 0.02 else 0.0151
+    giro = math.copysign(min(abs(wz), max(abs(wz) * fator, piso_giro)), wz)
+    return vx * fator, vy * fator, giro
+
+
 class Filtro:
     """Sem ROS (testavel): passo(t, vx, vy, wz) -> (vx, vy, wz)."""
 
@@ -85,6 +97,7 @@ class Filtro:
 def main():
     import rclpy
     from rclpy.node import Node
+    from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor
     from geometry_msgs.msg import TwistStamped
 
     class Suavizador(Node):
@@ -93,6 +106,8 @@ def main():
             self.declare_parameter('tau', TAU)
             self.declare_parameter('tau_giro', TAU_GIRO)
             self.declare_parameter('preservar_eixos_zero', False)
+            self.declare_parameter('fator_comando_corredor', 1.0, ParameterDescriptor(
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1.0)]))
             self.f = Filtro(float(self.get_parameter('tau').value),
                             float(self.get_parameter('tau_giro').value),
                             preservar_eixos_zero=bool(self.get_parameter('preservar_eixos_zero').value))
@@ -102,7 +117,9 @@ def main():
 
         def ao_cmd(self, msg):
             tw = msg.twist
-            vx, vy, wz = self.f.passo(time.monotonic(), tw.linear.x, tw.linear.y, tw.angular.z)
+            agora = time.monotonic()
+            cmd = self.f.passo(agora, tw.linear.x, tw.linear.y, tw.angular.z)
+            vx, vy, wz = comando_corredor(*cmd, self.get_parameter('fator_comando_corredor').value)
             out = TwistStamped()
             out.header.stamp = self.get_clock().now().to_msg()
             out.header.frame_id = msg.header.frame_id or 'base_link'
